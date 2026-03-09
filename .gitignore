@@ -28,4 +28,4 @@ extensions/*/dist
 .shopify/*
 .shopify.lock
 
-.vscode
+.vscode/*
