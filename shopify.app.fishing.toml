@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "1f9fbff85165b19bfddf82708b7b9f4e"
-name = "BRK Apps (Agro)"
+name = "BRK Apps (Fishing)"
 application_url = "https://localhost"
 embedded = true
 
