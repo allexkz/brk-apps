@@ -1,0 +1,15 @@
+query Input {
+  enteredDiscountCodes {
+    code
+  }
+  cart {
+    deliveryGroups {
+      deliveryOptions {
+        handle
+      }
+    }
+  }
+  discount {
+    discountClasses
+  }
+}
