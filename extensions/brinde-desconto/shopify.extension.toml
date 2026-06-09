@@ -1,0 +1,17 @@
+api_version = "2026-01"
+uid = "3e59af50-6896-c0c0-fadd-013a08c8633ebac971ed"
+
+[[extensions]]
+name = "Brinde Desconto"
+handle = "brinde-desconto"
+type = "function"
+description = "Aplica 100% de desconto no produto brinde quando o carrinho atinge o valor mínimo"
+
+  [[extensions.targeting]]
+  target = "cart.lines.discounts.generate.run"
+  input_query = "src/cart_lines_discounts_generate_run.graphql"
+  export = "cart-lines-discounts-generate-run"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"

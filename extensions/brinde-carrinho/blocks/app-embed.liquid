@@ -1,0 +1,23 @@
+{% assign brinde_cfg = shop.metafields.brk_brinde.config.value %}
+{% if brinde_cfg != blank and brinde_cfg.enabled %}
+  <div
+    id="brk-brinde-config"
+    data-variant-id="{{ brinde_cfg.variantNumericId }}"
+    data-threshold="{{ brinde_cfg.thresholdCents }}"
+    data-progress-message="{{ brinde_cfg.progressMessage | escape }}"
+    data-progress-reached="{{ brinde_cfg.progressReachedMessage | escape }}"
+    data-pb-desktop-selector="{{ brinde_cfg.progressBar.desktop.selector | escape }}"
+    data-pb-desktop-position="{{ brinde_cfg.progressBar.desktop.position | default: 'afterend' }}"
+    data-pb-mobile-selector="{{ brinde_cfg.progressBar.mobile.selector | escape }}"
+    data-pb-mobile-position="{{ brinde_cfg.progressBar.mobile.position | default: 'afterend' }}"
+    style="display:none;"
+  ></div>
+  <script src="{{ 'brinde.js' | asset_url }}" defer></script>
+{% endif %}
+
+{% schema %}
+{
+  "name": "Brinde Carrinho",
+  "target": "body"
+}
+{% endschema %}

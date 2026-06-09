@@ -2,7 +2,7 @@
 
 client_id = "1f9fbff85165b19bfddf82708b7b9f4e"
 name = "BRK Apps (Agro)"
-application_url = "https://localhost"
+application_url = "https://brk-apps-agro.allexadriel.workers.dev"
 embedded = true
 
 [build]
@@ -13,9 +13,9 @@ api_version = "2026-01"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_checkouts,read_discounts,read_validations,write_checkouts,write_discounts,write_validations"
+scopes = "read_all_orders,read_analytics,read_validations,write_validations,write_checkouts,read_checkouts,read_customers,read_discounts,write_discounts,read_fulfillments,read_inventory,read_marketing_events,read_orders,read_products,write_products,read_reports,read_returns,read_themes,read_shipping,write_shipping,read_delivery_customizations,write_delivery_customizations"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ ]
+redirect_urls = [ "https://brk-apps-agro.allexadriel.workers.dev/auth/callback" ]

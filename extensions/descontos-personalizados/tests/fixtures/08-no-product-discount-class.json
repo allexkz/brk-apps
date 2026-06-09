@@ -1,0 +1,25 @@
+{
+  "payload": {
+    "export": "cart-lines-discounts-generate-run",
+    "target": "cart.lines.discounts.generate.run",
+    "input": {
+      "cart": {
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/0",
+            "quantity": 2,
+            "cost": { "subtotalAmount": { "amount": "100.00" } },
+            "merchandise": { "__typename": "ProductVariant", "product": { "inAnyCollection": true } }
+          }
+        ]
+      },
+      "discount": {
+        "discountClasses": ["ORDER"],
+        "metafield": {
+          "jsonValue": { "enabled": true, "collectionIds": ["gid://shopify/Collection/1"], "percentage": 20 }
+        }
+      }
+    },
+    "output": { "operations": [] }
+  }
+}

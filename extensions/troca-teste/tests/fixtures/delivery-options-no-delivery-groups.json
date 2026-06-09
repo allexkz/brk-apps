@@ -3,6 +3,7 @@
     "export": "cart-delivery-options-discounts-generate-run",
     "target": "cart.delivery-options.discounts.generate.run",
     "input": {
+      "enteredDiscountCodes": [{ "code": "TROCA-456" }],
       "cart": {
         "deliveryGroups": []
       },

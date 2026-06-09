@@ -3,10 +3,13 @@
     "export": "cart-delivery-options-discounts-generate-run",
     "target": "cart.delivery-options.discounts.generate.run",
     "input": {
+      "enteredDiscountCodes": [{ "code": "TROCA-789" }],
       "cart": {
         "deliveryGroups": [
           {
-            "id": "gid://shopify/DeliveryGroup/0"
+            "deliveryOptions": [
+              { "handle": "standard", "cost": { "amount": "12.00" } }
+            ]
           }
         ]
       },

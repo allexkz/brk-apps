@@ -3,13 +3,18 @@
     "export": "cart-delivery-options-discounts-generate-run",
     "target": "cart.delivery-options.discounts.generate.run",
     "input": {
+      "enteredDiscountCodes": [{ "code": "TROCA-123" }],
       "discount": {
         "discountClasses": ["SHIPPING"]
       },
       "cart": {
         "deliveryGroups": [
           {
-            "id": "gid://shopify/CartDeliveryGroup/1"
+            "deliveryOptions": [
+              { "handle": "standard", "cost": { "amount": "15.00" } },
+              { "handle": "express", "cost": { "amount": "30.00" } },
+              { "handle": "overnight", "cost": { "amount": "50.00" } }
+            ]
           }
         ]
       }
@@ -18,13 +23,14 @@
       "operations": [
         {
           "deliveryDiscountsAdd": {
+            "selectionStrategy": "ALL",
             "candidates": [
               {
-                "message": "FREE DELIVERY",
+                "message": "Frete grátis para troca",
                 "targets": [
                   {
-                    "deliveryGroup": {
-                      "id": "gid://shopify/CartDeliveryGroup/1"
+                    "deliveryOption": {
+                      "handle": "standard"
                     }
                   }
                 ],
@@ -34,8 +40,7 @@
                   }
                 }
               }
-            ],
-            "selectionStrategy": "ALL"
+            ]
           }
         }
       ]

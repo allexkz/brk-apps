@@ -1,0 +1,15 @@
+query CartValidationsGenerateRunInput {
+  validation {
+    metafield(namespace: "brk-address-limit", key: "config") {
+      jsonValue
+    }
+  }
+  cart {
+    deliveryGroups {
+      deliveryAddress {
+        address1
+        address2
+      }
+    }
+  }
+}

@@ -17,6 +17,7 @@
   "author": "BRK",
   "private": true,
   "workspaces": [
-    "extensions/*"
+    "extensions/*",
+    "web"
   ]
 }
