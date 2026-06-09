@@ -64,22 +64,8 @@ export type Scalars = {
    * For example, "05:43:21".
    */
   TimeWithoutTimezone: { input: any; output: any; }
-  /**
-   * Represents an [RFC 3986](https://datatracker.ietf.org/doc/html/rfc3986) and
-   * [RFC 3987](https://datatracker.ietf.org/doc/html/rfc3987)-compliant URI string.
-   *
-   * For example, `"https://example.myshopify.com"` is a valid URL. It includes a scheme (`https`) and a host
-   * (`example.myshopify.com`).
-   */
-  URL: { input: any; output: any; }
   /** A void type that can be used to return a null value from a mutation. */
   Void: { input: any; output: any; }
-};
-
-/** A discount code that is associated with a discount candidate. */
-export type AssociatedDiscountCode = {
-  /** The discount code. */
-  code: Scalars['String']['input'];
 };
 
 /**
@@ -314,18 +300,15 @@ export type CartDeliveryOption = {
 };
 
 /**
- * The cart.delivery-options.discounts.generate.fetch target result. Refer to [network access](https://shopify.dev/apps/build/functions/input-output/network-access/graphql)
- * for Shopify Functions.
+ * The output of the Function run target.
+ * The object contains the operations to apply to delivery options in checkout.
  */
-export type CartDeliveryOptionsDiscountsGenerateFetchResult = {
-  /** The attributes associated with an HTTP request. */
-  request?: InputMaybe<HttpRequest>;
-};
-
-/** The cart.delivery-options.discounts.generate.run target result. */
-export type CartDeliveryOptionsDiscountsGenerateRunResult = {
-  /** An ordered list of operations to generate delivery discounts, such as validating and applying discounts to the cart. */
-  operations: Array<DeliveryOperation>;
+export type CartDeliveryOptionsTransformRunResult = {
+  /**
+   * The ordered list of operations to apply to the list of
+   * [delivery options](https://shopify.dev/docs/apps/build/checkout/delivery-shipping/delivery-options/build-function).
+   */
+  operations: Array<Operation>;
 };
 
 /**
@@ -408,84 +391,12 @@ export type CartLineCost = {
   totalAmount: MoneyV2;
 };
 
-/** The condition for checking the minimum quantity of products across a group of cart lines. */
-export type CartLineMinimumQuantity = {
-  /**
-   * Cart line IDs with a merchandise line price that's included to calculate the
-   * minimum quantity purchased to receive the discount.
-   */
-  ids: Array<Scalars['ID']['input']>;
-  /** The minimum quantity of a cart line to be eligible for a discount candidate. */
-  minimumQuantity: Scalars['Int']['input'];
-};
-
-/** The condition for checking the minimum subtotal of products across a group of cart lines. */
-export type CartLineMinimumSubtotal = {
-  /**
-   * Cart line IDs with a merchandise line price that's included to calculate the
-   * minimum subtotal purchased to receive the discount.
-   */
-  ids: Array<Scalars['ID']['input']>;
-  /** The minimum subtotal amount of the cart line to be eligible for a discount candidate in the shop's currency. */
-  minimumAmount: Scalars['Decimal']['input'];
-};
-
 /** Represents the relationship between a cart line and its parent line. */
 export type CartLineParentRelationship = {
   __typename?: 'CartLineParentRelationship';
   /** The parent line in the relationship. */
   parent: CartLine;
 };
-
-/**
- * A method for applying a discount to a specific line item in the cart. A cart line is an entry in the
- * customer's cart that represents a single unit of a product variant. For example, if a customer adds two
- * different sizes of the same t-shirt to their cart, then each size is represented as a separate cart line.
- */
-export type CartLineTarget = {
-  /** The ID of the targeted cart line. */
-  id: Scalars['ID']['input'];
-  /**
-   * The number of line items that are being discounted.
-   * The default value is `null`, which represents the quantity of the matching line items.
-   *
-   * The value is validated against: > 0.
-   */
-  quantity?: InputMaybe<Scalars['Int']['input']>;
-};
-
-/**
- * The cart.lines.discounts.generate.fetch target result. Refer to [network access](https://shopify.dev/apps/build/functions/input-output/network-access/graphql)
- * for Shopify Functions.
- */
-export type CartLinesDiscountsGenerateFetchResult = {
-  /** The HTTP request object. */
-  request?: InputMaybe<HttpRequest>;
-};
-
-/** The cart.lines.discounts.generate.run target result. */
-export type CartLinesDiscountsGenerateRunResult = {
-  /** The list of operations to apply discounts to the cart. */
-  operations: Array<CartOperation>;
-};
-
-/** The operations that can be performed to apply discounts to the cart. */
-export type CartOperation =
-  /**
-   * An operation that selects which entered discount codes to accept. Use this to
-   * validate discount codes from external systems.
-   */
-  { enteredDiscountCodesAccept: EnteredDiscountCodesAcceptOperation; enteredDiscountCodesReject?: never; orderDiscountsAdd?: never; productDiscountsAdd?: never; }
-  |  /**
-   * An operation that rejects entered discount codes with a custom message. Use
-   * this to conditionally reject discount codes based on business logic. This
-   * operation can only be used if the function is backed by an automatic discount.
-   */
-  { enteredDiscountCodesAccept?: never; enteredDiscountCodesReject: EnteredDiscountCodesRejectOperation; orderDiscountsAdd?: never; productDiscountsAdd?: never; }
-  |  /** An operation that applies order discounts to a cart that share a selection strategy. */
-  { enteredDiscountCodesAccept?: never; enteredDiscountCodesReject?: never; orderDiscountsAdd: OrderDiscountsAddOperation; productDiscountsAdd?: never; }
-  |  /** An operation that applies product discounts to a cart that share a selection strategy. */
-  { enteredDiscountCodesAccept?: never; enteredDiscountCodesReject?: never; orderDiscountsAdd?: never; productDiscountsAdd: ProductDiscountsAddOperation; };
 
 /**
  * Whether the product is in the specified collection.
@@ -597,15 +508,6 @@ export type CompanyLocationMetafieldArgs = {
   key: Scalars['String']['input'];
   namespace?: InputMaybe<Scalars['String']['input']>;
 };
-
-/** The conditions that satisfy the discount candidate to be applied to a cart line. */
-export type Condition =
-  /** The condition for checking the minimum quantity of products across a group of cart lines. */
-  { cartLineMinimumQuantity: CartLineMinimumQuantity; cartLineMinimumSubtotal?: never; orderMinimumSubtotal?: never; }
-  |  /** The condition for checking the minimum subtotal of products across a group of cart lines. */
-  { cartLineMinimumQuantity?: never; cartLineMinimumSubtotal: CartLineMinimumSubtotal; orderMinimumSubtotal?: never; }
-  |  /** The condition for checking the minimum subtotal amount of the order. */
-  { cartLineMinimumQuantity?: never; cartLineMinimumSubtotal?: never; orderMinimumSubtotal: OrderMinimumSubtotal; };
 
 /**
  * The country for which the store is customized, reflecting local preferences and regulations.
@@ -1588,87 +1490,24 @@ export type DeliverableCartLineAttributeArgs = {
   key?: InputMaybe<Scalars['String']['input']>;
 };
 
-/** The discount that's eligible to be applied to a delivery. */
-export type DeliveryDiscountCandidate = {
+/** A customization representing how delivery options will be ordered, hidden, or renamed. */
+export type DeliveryCustomization = HasMetafields & {
+  __typename?: 'DeliveryCustomization';
   /**
-   * An optional discount code associated with this discount candidate, for use
-   * with automatic discounts. If a code discount is the function trigger, the
-   * associated discount code will be overwritten by the triggering discount code.
+   * A [custom field](https://shopify.dev/docs/apps/build/custom-data) that stores additional information
+   * about a Shopify resource, such as products, orders, and
+   * [many more](https://shopify.dev/docs/api/admin-graphql/latest/enums/MetafieldOwnerType).
+   * Using [metafields with Shopify Functions](https://shopify.dev/docs/apps/build/functions/input-output/metafields-for-input-queries)
+   * enables you to customize the checkout experience.
    */
-  associatedDiscountCode?: InputMaybe<AssociatedDiscountCode>;
-  /**
-   * A notification on the **Cart** page informs customers about available
-   * discounts. If an automatic discount applies, the notification displays this
-   * message, such as "Save 20% on all t-shirts." If a discount code is entered,
-   * the notification displays the code instead.
-   */
-  message?: InputMaybe<Scalars['String']['input']>;
-  /** The targets of the discount that are eligible to be applied to a delivery. */
-  targets: Array<DeliveryDiscountCandidateTarget>;
-  /** The value of the discount that's eligible to be applied to a delivery. */
-  value: DeliveryDiscountCandidateValue;
+  metafield?: Maybe<Metafield>;
 };
 
-/** The target of the eligible delivery discount. */
-export type DeliveryDiscountCandidateTarget =
-  /**
-   * A method for applying a discount to a delivery group. Delivery groups streamline
-   * fulfillment by organizing items that can be shipped together, based on the customer's shipping address.
-   * For example, if a customer orders a t-shirt and a pair of shoes that can be shipped together, then the
-   * items are included in the same delivery group.
-   */
-  { deliveryGroup: DeliveryGroupTarget; deliveryOption?: never; }
-  |  /**
-   * A method for applying a discount to a delivery option within a delivery group.
-   * Delivery options are the different ways that customers can choose to have their
-   * orders shipped. Examples of delivery options include express shipping or standard shipping.
-   */
-  { deliveryGroup?: never; deliveryOption: DeliveryOptionTarget; };
 
-/** The value of the eligible delivery discount. */
-export type DeliveryDiscountCandidateValue =
-  /** A fixed amount value. */
-  { fixedAmount: FixedAmount; percentage?: never; }
-  |  /** A percentage value. */
-  { fixedAmount?: never; percentage: Percentage; };
-
-/** The strategy that's applied to the list of discounts that are eligible to be applied to a delivery. */
-export enum DeliveryDiscountSelectionStrategy {
-  /**
-   * Apply all discounts that are eligible to be applied to a delivery with
-   * conditions that are satisfied. This doesn't override
-   * discount combination or stacking rules.
-   */
-  All = 'ALL'
-}
-
-/**
- * Applies delivery discounts to a cart that share a method for determining which
- * shipping and delivery discounts to apply when multiple discounts are eligible.
- */
-export type DeliveryDiscountsAddOperation = {
-  /** The list of discounts that are eligible to be applied to a delivery. */
-  candidates: Array<DeliveryDiscountCandidate>;
-  /**
-   * The method for determining which shipping and delivery discounts to apply when
-   * multiple discounts are eligible. For example, when the "ALL" strategy is
-   * selected, every shipping and delivery discount that qualifies is applied to
-   * the cart (for example, free shipping on orders over $50 and $5 off express
-   * shipping). This controls how shipping and delivery discounts interact when
-   * multiple conditions are satisfied simultaneously.
-   */
-  selectionStrategy: DeliveryDiscountSelectionStrategy;
-};
-
-/**
- * A method for applying a discount to a delivery group. Delivery groups streamline
- * fulfillment by organizing items that can be shipped together, based on the customer's shipping address.
- * For example, if a customer orders a t-shirt and a pair of shoes that can be shipped together, then the
- * items are included in the same delivery group.
- */
-export type DeliveryGroupTarget = {
-  /** The ID of the target delivery group. */
-  id: Scalars['ID']['input'];
+/** A customization representing how delivery options will be ordered, hidden, or renamed. */
+export type DeliveryCustomizationMetafieldArgs = {
+  key: Scalars['String']['input'];
+  namespace?: InputMaybe<Scalars['String']['input']>;
 };
 
 /** List of different delivery method types. */
@@ -1687,133 +1526,94 @@ export enum DeliveryMethod {
   Shipping = 'SHIPPING'
 }
 
+/** An operation that hides a delivery option from a list that's offered to customers at checkout. */
+export type DeliveryOptionHideOperation = {
+  /** The handle of the delivery option to hide. */
+  deliveryOptionHandle: Scalars['Handle']['input'];
+};
+
 /**
- * The operations to apply discounts to shipping and delivery charges in a
- * customer's cart. These operations allow you to reduce the cost of shipping by
- * applying percentage or fixed-amount discounts to specific delivery options (such
- * as standard shipping and express shipping) or delivery groups (such as
- * collections of delivery options).
+ * An operation that sorts a list of delivery options that are offered to customers at checkout.
+ *
+ * If you reorder shipping delivery options, then you are
+ * [prohibited](https://shopify.dev/docs/apps/launch/app-requirements-checklist#prohibited-app-types).
+ * from automatically selecting higher-priced delivery alternatives by default. The cheapest shipping delivery option
+ * must always be the first option selected.
  */
-export type DeliveryOperation =
+export type DeliveryOptionMoveOperation = {
+  /** The handle of the delivery option to move. */
+  deliveryOptionHandle: Scalars['Handle']['input'];
+  /** The target index within the delivery group to move the delivery option to. */
+  index: Scalars['Int']['input'];
+};
+
+/**
+ * An operation that renames a delivery option that's offered to customers at checkout.
+ *
+ * The carrier name is automatically prepended to the delivery option title at checkout when using the
+ * `DeliveryOptionRenameOperation` object, and can't be altered or omitted through the API. For example, if the carrier name
+ * is **UPS** and the option is **Standard**, then you could change **UPS Standard** to **UPS Standard Shipping**,
+ * but you couldn't change **UPS Standard** to **Standard Shipping**.
+ */
+export type DeliveryOptionRenameOperation = {
+  /** The handle of the delivery option to rename. */
+  deliveryOptionHandle: Scalars['Handle']['input'];
+  /** The new name for the delivery option. */
+  title: Scalars['String']['input'];
+};
+
+/** An operation to apply to the list of [delivery options](https://shopify.dev/docs/apps/build/checkout/delivery-shipping/delivery-options/build-function). */
+export type DeprecatedOperation =
   /**
-   * Applies delivery discounts to a cart that share a method for determining which
-   * shipping and delivery discounts to apply when multiple discounts are eligible.
+   * An operation that hides a delivery option from a list that's offered to customers at checkout.
+   * @deprecated Use `deliveryOptionHide` instead.
    */
-  { deliveryDiscountsAdd: DeliveryDiscountsAddOperation; enteredDiscountCodesAccept?: never; enteredDiscountCodesReject?: never; }
+  { hide: HideOperation; move?: never; rename?: never; }
   |  /**
-   * An operation that selects which entered discount codes to accept. Use this to
-   * validate discount codes from external systems.
+   * An operation that sorts a list of delivery options that are offered to customers at checkout.
+   *
+   * If you reorder shipping delivery options, then you are
+   * [prohibited](https://shopify.dev/docs/apps/launch/app-requirements-checklist#prohibited-app-types).
+   * from automatically selecting higher-priced delivery alternatives by default. The cheapest shipping delivery option
+   * must always be the first option selected.
+   * @deprecated Use `deliveryOptionMove` instead.
    */
-  { deliveryDiscountsAdd?: never; enteredDiscountCodesAccept: EnteredDiscountCodesAcceptOperation; enteredDiscountCodesReject?: never; }
+  { hide?: never; move: MoveOperation; rename?: never; }
   |  /**
-   * An operation that rejects entered discount codes with a custom message. Use
-   * this to conditionally reject discount codes based on business logic. This
-   * operation can only be used if the function is backed by an automatic discount.
-   */
-  { deliveryDiscountsAdd?: never; enteredDiscountCodesAccept?: never; enteredDiscountCodesReject: EnteredDiscountCodesRejectOperation; };
-
-/**
- * A method for applying a discount to a delivery option within a delivery group.
- * Delivery options are the different ways that customers can choose to have their
- * orders shipped. Examples of delivery options include express shipping or standard shipping.
- */
-export type DeliveryOptionTarget = {
-  /** The handle of the target delivery option. */
-  handle: Scalars['Handle']['input'];
-};
-
-/** The discount that invoked the [Discount Function](https://shopify.dev/docs/apps/build/discounts#build-with-shopify-functions)). */
-export type Discount = HasMetafields & {
-  __typename?: 'Discount';
-  /** The [discount classes](https://shopify.dev/docs/apps/build/discounts/#discount-classes) that the [discountNode](https://shopify.dev/docs/api/admin-graphql/latest/queries/discountNode) supports. */
-  discountClasses: Array<DiscountClass>;
-  /**
-   * A [custom field](https://shopify.dev/docs/apps/build/custom-data) that stores additional information
-   * about a Shopify resource, such as products, orders, and
-   * [many more](https://shopify.dev/docs/api/admin-graphql/latest/enums/MetafieldOwnerType).
-   * Using [metafields with Shopify Functions](https://shopify.dev/docs/apps/build/functions/input-output/metafields-for-input-queries)
-   * enables you to customize the checkout experience.
-   */
-  metafield?: Maybe<Metafield>;
-};
-
-
-/** The discount that invoked the [Discount Function](https://shopify.dev/docs/apps/build/discounts#build-with-shopify-functions)). */
-export type DiscountMetafieldArgs = {
-  key: Scalars['String']['input'];
-  namespace?: InputMaybe<Scalars['String']['input']>;
-};
-
-/**
- * The [discount class](https://help.shopify.com/manual/discounts/combining-discounts/discount-combinations)
- * that's used to control how discounts can be combined.
- */
-export enum DiscountClass {
-  /**
-   * The discount is combined with an
-   * [order discount](https://help.shopify.com/manual/discounts/combining-discounts/discount-combinations)
-   * class.
-   */
-  Order = 'ORDER',
-  /**
-   * The discount is combined with a
-   * [product discount](https://help.shopify.com/manual/discounts/combining-discounts/discount-combinations)
-   * class.
-   */
-  Product = 'PRODUCT',
-  /**
-   * The discount is combined with a
-   * [shipping discount](https://help.shopify.com/manual/discounts/combining-discounts/discount-combinations)
-   * class.
-   */
-  Shipping = 'SHIPPING'
-}
-
-/** A discount code used by the buyer to add a discount to the cart. */
-export type DiscountCode = {
-  /** The discount code. */
-  code: Scalars['String']['input'];
-};
-
-/** A discount code entered by the customer. */
-export type EnteredDiscountCode = {
-  __typename?: 'EnteredDiscountCode';
-  /** The discount code. */
-  code: Scalars['String']['output'];
-  /**
-   * Indicates whether the entered discount code can be rejected.
+   * An operation that renames a delivery option that's offered to customers at checkout.
    *
-   * A discount code can't be rejected if it's associated with a discount that has already been applied to the cart.
+   * The carrier name is automatically prepended to the delivery option title at checkout when using the
+   * `RenameOperation` object, and can't be altered or omitted through the API. For example, if the carrier name
+   * is **UPS** and the option is **Standard**, then you could change **UPS Standard** to **UPS Standard Shipping**,
+   * but you couldn't change **UPS Standard** to **Standard Shipping**.
+   * @deprecated Use `deliveryOptionRename` instead.
    */
-  rejectable: Scalars['Boolean']['output'];
-};
+  { hide?: never; move?: never; rename: RenameOperation; };
 
-/** An operation that selects which entered discount codes to accept. Use this to validate discount codes from external systems. */
-export type EnteredDiscountCodesAcceptOperation = {
-  /** The list of discount codes to accept. */
-  codes: Array<DiscountCode>;
+/**
+ * The output of the Function run target.
+ * The object contains the operations to apply to delivery options in checkout. In
+ * API versions 2023-10 and beyond, this type is deprecated in favor of
+ * `FunctionRunResult`.
+ */
+export type FunctionResult = {
+  /**
+   * The ordered list of operations to apply to the list of
+   * [delivery options](https://shopify.dev/docs/apps/build/checkout/delivery-shipping/delivery-options/build-function).
+   */
+  operations: Array<DeprecatedOperation>;
 };
 
 /**
- * An operation that rejects entered discount codes with a custom message. Use this
- * to conditionally reject discount codes based on business logic. This operation
- * can only be used if the function is backed by an automatic discount.
+ * The output of the Function run target.
+ * The object contains the operations to apply to delivery options in checkout.
  */
-export type EnteredDiscountCodesRejectOperation = {
-  /** The list of discount codes to reject. */
-  codes: Array<RejectedDiscountCode>;
-  /** The custom message to display to the customer when the discount codes are rejected. */
-  message: Scalars['String']['input'];
-};
-
-/** A fixed amount value. */
-export type FixedAmount = {
+export type FunctionRunResult = {
   /**
-   * The fixed amount value of the discount, in the currency of the cart.
-   *
-   * The amount must be greater than or equal to 0.
+   * The ordered list of operations to apply to the list of
+   * [delivery options](https://shopify.dev/docs/apps/build/checkout/delivery-shipping/delivery-options/build-function).
    */
-  amount: Scalars['Decimal']['input'];
+  operations: Array<DeprecatedOperation>;
 };
 
 /** Represents information about the metafields associated to the specified resource. */
@@ -1848,101 +1648,12 @@ export type HasTagResponse = {
   tag: Scalars['String']['output'];
 };
 
-/** The attributes associated with an HTTP request. */
-export type HttpRequest = {
-  /**
-   * The HTTP request body as a plain string.
-   * Use this field when the body isn't in JSON format.
-   */
-  body?: InputMaybe<Scalars['String']['input']>;
-  /** The HTTP headers. */
-  headers: Array<HttpRequestHeader>;
-  /**
-   * The HTTP request body as a JSON object.
-   * Use this field when the body's in JSON format, to reduce function instruction consumption
-   * and to ensure the body's formatted in logs.
-   * Don't use this field together with the `body` field. If both are provided, then the `body` field
-   * will take precedence.
-   * If this field is specified and no `Content-Type` header is included, then the header will
-   * automatically be set to `application/json`.
-   */
-  jsonBody?: InputMaybe<Scalars['JSON']['input']>;
-  /** The HTTP method. */
-  method: HttpRequestMethod;
-  /** Policy attached to the HTTP request. */
-  policy: HttpRequestPolicy;
-  /** The HTTP url (eg.: https://example.com). The scheme needs to be HTTPS. */
-  url: Scalars['URL']['input'];
+/** An operation that hides a delivery option from a list that's offered to customers at checkout. */
+export type HideOperation = {
+  /** The handle of the delivery option to hide. */
+  deliveryOptionHandle: Scalars['Handle']['input'];
 };
 
-/** The attributes associated with an HTTP request header. */
-export type HttpRequestHeader = {
-  /** Header name. */
-  name: Scalars['String']['input'];
-  /** Header value. */
-  value: Scalars['String']['input'];
-};
-
-/** The HTTP request available methods. */
-export enum HttpRequestMethod {
-  /** Http GET. */
-  Get = 'GET',
-  /** Http POST. */
-  Post = 'POST'
-}
-
-/** The attributes associated with an HTTP request policy. */
-export type HttpRequestPolicy = {
-  /** Read timeout in milliseconds. */
-  readTimeoutMs: Scalars['Int']['input'];
-};
-
-/** The attributes associated with an HTTP response. */
-export type HttpResponse = {
-  __typename?: 'HttpResponse';
-  /**
-   * The HTTP response body as a plain string.
-   * Use this field when the body is not in JSON format.
-   */
-  body?: Maybe<Scalars['String']['output']>;
-  /** An HTTP header. */
-  header?: Maybe<HttpResponseHeader>;
-  /**
-   * The HTTP headers.
-   * @deprecated Use `header` instead.
-   */
-  headers: Array<HttpResponseHeader>;
-  /**
-   * The HTTP response body parsed as JSON.
-   * If the body is valid JSON, it will be parsed and returned as a JSON object.
-   * If parsing fails, then raw body is returned as a string.
-   * Use this field when you expect the response to be JSON, or when you're dealing
-   * with mixed response types, meaning both JSON and non-JSON.
-   * Using this field reduces function instruction consumption and ensures that the data is formatted in logs.
-   * To prevent increasing the function target input size unnecessarily, avoid querying
-   * both `body` and `jsonBody` simultaneously.
-   */
-  jsonBody?: Maybe<Scalars['JSON']['output']>;
-  /** The HTTP status code. */
-  status: Scalars['Int']['output'];
-};
-
-
-/** The attributes associated with an HTTP response. */
-export type HttpResponseHeaderArgs = {
-  name: Scalars['String']['input'];
-};
-
-/** The attributes associated with an HTTP response header. */
-export type HttpResponseHeader = {
-  __typename?: 'HttpResponseHeader';
-  /** Header name. */
-  name: Scalars['String']['output'];
-  /** Header value. */
-  value: Scalars['String']['output'];
-};
-
-/** The input object for the Function. */
 export type Input = {
   __typename?: 'Input';
   /**
@@ -1951,27 +1662,13 @@ export type Input = {
    */
   cart: Cart;
   /**
-   * The discount node that owns the [Shopify
-   * Function](https://shopify.dev/docs/apps/build/functions). Discounts are a way
-   * for merchants to promote sales and special offers, or as customer loyalty
-   * rewards. A single discount can be automatic or code-based, and can be applied
-   * to a cart lines, orders, and delivery.
+   * The backend logic that the Function is running to define how
+   * [delivery options](https://shopify.dev/apps/build/checkout/delivery-shipping/delivery-options/build-function)
+   * are sorted, hidden, or renamed. It includes the
+   * [metafields](https://shopify.dev/docs/apps/build/custom-data)
+   * that are associated with the customization.
    */
-  discount: Discount;
-  /**
-   * Discount codes entered by the buyer at checkout, excluding gift cards. For
-   * cart.lines.discounts.generate.run and cart.delivery-options.discounts.generate.run targets, these
-   * discount codes are validated to ensure they are not deleted, maintain an active status, and are eligible
-   * for the current cart. For fetch targets, all entered discount codes are included, excluding gift cards.
-   */
-  enteredDiscountCodes: Array<EnteredDiscountCode>;
-  /**
-   * The result of the fetch target. Refer to [network access](https://shopify.dev/apps/build/functions/input-output/network-access/graphql)
-   * for Shopify Functions. This input is only available in the
-   * `cart.lines.discounts.generate.run` and
-   * `cart.delivery-options.discounts.generate.run` extension targets.
-   */
-  fetchResult?: Maybe<HttpResponse>;
+  deliveryCustomization: DeliveryCustomization;
   /**
    * The regional and language settings that determine how the Function
    * handles currency, numbers, dates, and other locale-specific values
@@ -1991,12 +1688,6 @@ export type Input = {
    * setting and associated [metafields](https://shopify.dev/docs/apps/build/custom-data).
    */
   shop: Shop;
-  /**
-   * The discount code entered by a customer, which caused the [Discount Function](https://shopify.dev/docs/apps/build/discounts#build-with-shopify-functions) to run.
-   * This input is only available in the `cart.lines.discounts.generate.run` and
-   * `cart.delivery-options.discounts.generate.run` extension targets.
-   */
-  triggeringDiscountCode?: Maybe<Scalars['String']['output']>;
 };
 
 /**
@@ -2699,128 +2390,75 @@ export type MoneyV2 = {
   currencyCode: CurrencyCode;
 };
 
+/**
+ * An operation that sorts a list of delivery options that are offered to customers at checkout.
+ *
+ * If you reorder shipping delivery options, then you are
+ * [prohibited](https://shopify.dev/docs/apps/launch/app-requirements-checklist#prohibited-app-types).
+ * from automatically selecting higher-priced delivery alternatives by default. The cheapest shipping delivery option
+ * must always be the first option selected.
+ */
+export type MoveOperation = {
+  /** The handle of the delivery option to move. */
+  deliveryOptionHandle: Scalars['Handle']['input'];
+  /** The target index within the delivery group to move the delivery option to. */
+  index: Scalars['Int']['input'];
+};
+
 /** The root mutation for the API. */
 export type MutationRoot = {
   __typename?: 'MutationRoot';
-  /** Handles the Function result for the cart.delivery-options.discounts.generate.fetch target. */
-  cartDeliveryOptionsDiscountsGenerateFetch: Scalars['Void']['output'];
-  /** Handles the Function result for the cart.delivery-options.discounts.generate.run target. */
-  cartDeliveryOptionsDiscountsGenerateRun: Scalars['Void']['output'];
-  /** Handles the Function result for the cart.lines.discounts.generate.fetch target. */
-  cartLinesDiscountsGenerateFetch: Scalars['Void']['output'];
-  /** Handles the Function result for the cart.lines.discounts.generate.run target. */
-  cartLinesDiscountsGenerateRun: Scalars['Void']['output'];
+  /** Handles the Function result for the cart.delivery-options.transform.run target. */
+  cartDeliveryOptionsTransformRun: Scalars['Void']['output'];
+  /**
+   * Handles the Function result.
+   * @deprecated Use the target-specific field instead.
+   */
+  handleResult: Scalars['Void']['output'];
+  /** Handles the Function result for the purchase.delivery-customization.run target. */
+  run: Scalars['Void']['output'];
 };
 
 
 /** The root mutation for the API. */
-export type MutationRootCartDeliveryOptionsDiscountsGenerateFetchArgs = {
-  result: CartDeliveryOptionsDiscountsGenerateFetchResult;
+export type MutationRootCartDeliveryOptionsTransformRunArgs = {
+  result: CartDeliveryOptionsTransformRunResult;
 };
 
 
 /** The root mutation for the API. */
-export type MutationRootCartDeliveryOptionsDiscountsGenerateRunArgs = {
-  result: CartDeliveryOptionsDiscountsGenerateRunResult;
+export type MutationRootHandleResultArgs = {
+  result: FunctionResult;
 };
 
 
 /** The root mutation for the API. */
-export type MutationRootCartLinesDiscountsGenerateFetchArgs = {
-  result: CartLinesDiscountsGenerateFetchResult;
+export type MutationRootRunArgs = {
+  result: FunctionRunResult;
 };
 
-
-/** The root mutation for the API. */
-export type MutationRootCartLinesDiscountsGenerateRunArgs = {
-  result: CartLinesDiscountsGenerateRunResult;
-};
-
-/** A discount candidate to be applied to an eligible order. */
-export type OrderDiscountCandidate = {
-  /**
-   * An optional discount code associated with this discount candidate, for use
-   * with automatic discounts. If a code discount is the function trigger, the
-   * associated discount code will be overwritten by the triggering discount code.
-   */
-  associatedDiscountCode?: InputMaybe<AssociatedDiscountCode>;
-  /** The conditions that must be satisfied for an order to be eligible for a discount candidate. */
-  conditions?: InputMaybe<Array<Condition>>;
-  /**
-   * A notification on the **Cart** page informs customers about available
-   * discounts. If an automatic discount applies, the notification displays this
-   * message, such as "Save 20% on all t-shirts." If a discount code is entered,
-   * the notification displays the code instead.
-   */
-  message?: InputMaybe<Scalars['String']['input']>;
-  /** The targets of the order discount candidate. */
-  targets: Array<OrderDiscountCandidateTarget>;
-  /** The value of the order discount candidate. */
-  value: OrderDiscountCandidateValue;
-};
-
-/** A target of an order to be eligible for a discount candidate. */
-export type OrderDiscountCandidateTarget =
-  /**
-   * A method for applying a discount to the entire order subtotal. The subtotal is the total amount of the
-   * order before any taxes, shipping fees, or discounts are applied. For example, if a customer places an order
-   * for a t-shirt and a pair of shoes, then the subtotal is the sum of the prices of those items.
-   */
-  { orderSubtotal: OrderSubtotalTarget; };
-
-/** The value of the order discount candidate. */
-export type OrderDiscountCandidateValue =
-  /** A fixed amount value. */
-  { fixedAmount: FixedAmount; percentage?: never; }
-  |  /** A percentage value. */
-  { fixedAmount?: never; percentage: Percentage; };
-
-/** The strategy that's applied to the list of order discount candidates. */
-export enum OrderDiscountSelectionStrategy {
-  /** Only apply the first order discount candidate with conditions that are satisfied. */
-  First = 'FIRST',
-  /** Only apply the order discount candidate that offers the maximum reduction. */
-  Maximum = 'MAXIMUM'
-}
-
-/** An operation that applies order discounts to a cart that share a selection strategy. */
-export type OrderDiscountsAddOperation = {
-  /** The list of discounts that can be applied to an order. */
-  candidates: Array<OrderDiscountCandidate>;
-  /** The strategy that's applied to the list of discounts. */
-  selectionStrategy: OrderDiscountSelectionStrategy;
-};
-
-/** The condition for checking the minimum subtotal amount of the order. */
-export type OrderMinimumSubtotal = {
-  /** Cart line IDs with a merchandise line price that's excluded to calculate the minimum subtotal amount of the order. */
-  excludedCartLineIds: Array<Scalars['ID']['input']>;
-  /** The minimum subtotal amount of the order to be eligible for the discount in the shop's currency. */
-  minimumAmount: Scalars['Decimal']['input'];
-};
-
-/**
- * A method for applying a discount to the entire order subtotal. The subtotal is the total amount of the
- * order before any taxes, shipping fees, or discounts are applied. For example, if a customer places an order
- * for a t-shirt and a pair of shoes, then the subtotal is the sum of the prices of those items.
- */
-export type OrderSubtotalTarget = {
-  /**
-   * The list of excluded cart line IDs. These cart lines are excluded from the order
-   * subtotal calculation when calculating the maximum value of the discount.
-   */
-  excludedCartLineIds: Array<Scalars['ID']['input']>;
-};
-
-/** A percentage value. */
-export type Percentage = {
-  /**
-   * The percentage value.
+/** An operation to apply to the list of [delivery options](https://shopify.dev/docs/apps/build/checkout/delivery-shipping/delivery-options/build-function). */
+export type Operation =
+  /** An operation that hides a delivery option from a list that's offered to customers at checkout. */
+  { deliveryOptionHide: DeliveryOptionHideOperation; deliveryOptionMove?: never; deliveryOptionRename?: never; }
+  |  /**
+   * An operation that sorts a list of delivery options that are offered to customers at checkout.
    *
-   * The value is validated against: >= 0 and <= 100.
+   * If you reorder shipping delivery options, then you are
+   * [prohibited](https://shopify.dev/docs/apps/launch/app-requirements-checklist#prohibited-app-types).
+   * from automatically selecting higher-priced delivery alternatives by default. The cheapest shipping delivery option
+   * must always be the first option selected.
    */
-  value: Scalars['Decimal']['input'];
-};
+  { deliveryOptionHide?: never; deliveryOptionMove: DeliveryOptionMoveOperation; deliveryOptionRename?: never; }
+  |  /**
+   * An operation that renames a delivery option that's offered to customers at checkout.
+   *
+   * The carrier name is automatically prepended to the delivery option title at checkout when using the
+   * `DeliveryOptionRenameOperation` object, and can't be altered or omitted through the API. For example, if the carrier name
+   * is **UPS** and the option is **Standard**, then you could change **UPS Standard** to **UPS Standard Shipping**,
+   * but you couldn't change **UPS Standard** to **Standard Shipping**.
+   */
+  { deliveryOptionHide?: never; deliveryOptionMove?: never; deliveryOptionRename: DeliveryOptionRenameOperation; };
 
 /**
  * The goods and services that merchants offer to customers. Products can include details such as
@@ -2954,95 +2592,6 @@ export type ProductMetafieldArgs = {
   namespace?: InputMaybe<Scalars['String']['input']>;
 };
 
-/** The target and value of the discount to be applied to a cart line. */
-export type ProductDiscountCandidate = {
-  /**
-   * An optional discount code associated with this discount candidate, for use
-   * with automatic discounts. If a code discount is the function trigger, the
-   * associated discount code will be overwritten by the triggering discount code.
-   */
-  associatedDiscountCode?: InputMaybe<AssociatedDiscountCode>;
-  /**
-   * A notification on the **Cart** page informs customers about available
-   * discounts. If an automatic discount applies, the notification displays this
-   * message, such as "Save 20% on all t-shirts." If a discount code is entered,
-   * the notification displays the code instead.
-   */
-  message?: InputMaybe<Scalars['String']['input']>;
-  /** The targets of the discount to be applied to a cart line. */
-  targets: Array<ProductDiscountCandidateTarget>;
-  /**
-   * The value of the discount to be applied to a cart line. For example, a fixed
-   * amount of $5 off or percentage value of 20% off.
-   */
-  value: ProductDiscountCandidateValue;
-};
-
-/**
- * The [fixed-amount](https://help.shopify.com/manual/international/pricing/discounts)
- * value of the discount to be applied to a cart line. For example, if the cart
- * total is $100 and the discount is $10, then the fixed amount is $10.
- */
-export type ProductDiscountCandidateFixedAmount = {
-  /**
-   * The [fixed-amount](https://help.shopify.com/manual/international/pricing/discounts) value of the discount to be applied to a cart line, in the currency of the
-   * cart. The amount must be greater than or equal to 0.
-   */
-  amount: Scalars['Decimal']['input'];
-  /**
-   * Whether to apply the value of each eligible discount to each eligible cart line.
-   *
-   * The default value is `false`, which causes the value to be applied once across the entitled items.
-   * When the value is `true`, the value will be applied to each of the entitled items.
-   */
-  appliesToEachItem?: InputMaybe<Scalars['Boolean']['input']>;
-};
-
-/**
- * Defines discount candidates, which are cart lines that may be eligible for
- * potential discounts. Use discount candidates to identify items in a customer's
- * cart that could receive discounts based on conditions in the selection strategy.
- *
- * When multiple cart lines share the same type and ID, the system treats them as a
- * single target and combines their quantities. The combined quantity becomes null
- * if any individual target has a `null` quantity.
- */
-export type ProductDiscountCandidateTarget =
-  /**
-   * A method for applying a discount to a specific line item in the cart. A cart line is an entry in the
-   * customer's cart that represents a single unit of a product variant. For example, if a customer adds two
-   * different sizes of the same t-shirt to their cart, then each size is represented as a separate cart line.
-   */
-  { cartLine: CartLineTarget; };
-
-/** The value of the discount candidate to be applied to a cart line. */
-export type ProductDiscountCandidateValue =
-  /**
-   * The [fixed-amount](https://help.shopify.com/manual/international/pricing/discounts) value of the discount to be applied to a cart line. For example, if the cart
-   * total is $100 and the discount is $10, then the fixed amount is $10.
-   */
-  { fixedAmount: ProductDiscountCandidateFixedAmount; percentage?: never; }
-  |  /** A percentage value. */
-  { fixedAmount?: never; percentage: Percentage; };
-
-/** The selection strategy that's applied to the list of discounts that are eligible for cart lines. */
-export enum ProductDiscountSelectionStrategy {
-  /** Apply all the discount candidates to eligible cart lines. This doesn't override discount combination or stacking rules. */
-  All = 'ALL',
-  /** Apply the first discount candidate to cart lines that satisfies conditions. */
-  First = 'FIRST',
-  /** Apply the discount to the cart line that offers the maximum reduction. */
-  Maximum = 'MAXIMUM'
-}
-
-/** An operation that applies product discounts to a cart that share a selection strategy. */
-export type ProductDiscountsAddOperation = {
-  /** The list of products that are eligible for the discount. */
-  candidates: Array<ProductDiscountCandidate>;
-  /** The strategy that's applied to the list of products that are eligible for the cart line discount. */
-  selectionStrategy: ProductDiscountSelectionStrategy;
-};
-
 /**
  * A specific version of a product that comes in more than one option, such as size or color. For example,
  * if a merchant sells t-shirts with options for size and color, then a small, blue t-shirt would be one
@@ -3115,10 +2664,19 @@ export type PurchasingCompany = {
   location: CompanyLocation;
 };
 
-/** A discount code to be rejected. */
-export type RejectedDiscountCode = {
-  /** The discount code to reject. */
-  code: Scalars['String']['input'];
+/**
+ * An operation that renames a delivery option that's offered to customers at checkout.
+ *
+ * The carrier name is automatically prepended to the delivery option title at checkout when using the
+ * `RenameOperation` object, and can't be altered or omitted through the API. For example, if the carrier name
+ * is **UPS** and the option is **Standard**, then you could change **UPS Standard** to **UPS Standard Shipping**,
+ * but you couldn't change **UPS Standard** to **Standard Shipping**.
+ */
+export type RenameOperation = {
+  /** The handle of the delivery option to rename. */
+  deliveryOptionHandle: Scalars['Handle']['input'];
+  /** The new name for the delivery option. */
+  title: Scalars['String']['input'];
 };
 
 /** Represents how products and variants can be sold and purchased. */
@@ -3233,12 +2791,7 @@ export enum WeightUnit {
   Pounds = 'POUNDS'
 }
 
-export type InputVariables = Exact<{ [key: string]: never; }>;
+export type RunInputVariables = Exact<{ [key: string]: never; }>;
 
 
-export type Input = { __typename?: 'Input', enteredDiscountCodes: Array<{ __typename?: 'EnteredDiscountCode', code: string }>, cart: { __typename?: 'Cart', deliveryGroups: Array<{ __typename?: 'CartDeliveryGroup', deliveryOptions: Array<{ __typename?: 'CartDeliveryOption', handle: any, cost: { __typename?: 'MoneyV2', amount: any } }> }> }, discount: { __typename?: 'Discount', discountClasses: Array<DiscountClass> } };
-
-export type CartInputVariables = Exact<{ [key: string]: never; }>;
-
-
-export type CartInput = { __typename?: 'Input', cart: { __typename?: 'Cart', lines: Array<{ __typename?: 'CartLine', id: string, cost: { __typename?: 'CartLineCost', subtotalAmount: { __typename?: 'MoneyV2', amount: any } } }> }, discount: { __typename?: 'Discount', discountClasses: Array<DiscountClass> } };
+export type RunInput = { __typename?: 'Input', cart: { __typename?: 'Cart', deliveryGroups: Array<{ __typename?: 'CartDeliveryGroup', deliveryOptions: Array<{ __typename?: 'CartDeliveryOption', handle: any, title?: string | null, code?: string | null }> }> } };

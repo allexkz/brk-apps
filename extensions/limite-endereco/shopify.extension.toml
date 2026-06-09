@@ -1,0 +1,17 @@
+api_version = "2026-01"
+uid = "dfb6e78e-8e34-b98e-8e95-20a5e39290dec3684009"
+
+[[extensions]]
+name = "Limite Endereco"
+handle = "limite-endereco"
+type = "function"
+description = "Valida o limite de caracteres no campo Rua do endereco de entrega"
+
+  [[extensions.targeting]]
+  target = "cart.validations.generate.run"
+  input_query = "src/cart_validations_generate_run.graphql"
+  export = "cart-validations-generate-run"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"

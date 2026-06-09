@@ -1,0 +1,27 @@
+query CartInput($collectionIds: [ID!]) {
+  cart {
+    lines {
+      id
+      quantity
+      cost {
+        subtotalAmount {
+          amount
+        }
+      }
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          product {
+            inAnyCollection(ids: $collectionIds)
+          }
+        }
+      }
+    }
+  }
+  discount {
+    discountClasses
+    metafield(namespace: "$app:descontos-personalizados", key: "config") {
+      jsonValue
+    }
+  }
+}
