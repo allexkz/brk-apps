@@ -1,0 +1,4 @@
+{
+  "name": "Limite Endereco",
+  "description": "Valida o limite de caracteres no campo Rua do endereco de entrega"
+}

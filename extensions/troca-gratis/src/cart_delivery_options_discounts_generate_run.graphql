@@ -6,6 +6,9 @@ query Input {
     deliveryGroups {
       deliveryOptions {
         handle
+        cost {
+          amount
+        }
       }
     }
   }

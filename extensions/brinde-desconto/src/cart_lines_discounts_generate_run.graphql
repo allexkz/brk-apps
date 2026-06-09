@@ -1,0 +1,19 @@
+query Input {
+  discount {
+    discountClasses
+  }
+  cart {
+    lines {
+      id
+      quantity
+      attribute(key: "_brk_gift_progress") {
+        value
+      }
+      cost {
+        subtotalAmount {
+          amount
+        }
+      }
+    }
+  }
+}

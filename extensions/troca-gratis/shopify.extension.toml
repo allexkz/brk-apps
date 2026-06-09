@@ -1,11 +1,11 @@
 api_version = "2026-01"
+uid = "24e71357-b722-e37b-6b78-a54191c6bbc33ca54f12"
 
 [[extensions]]
-name = "t:name"
+name = "troca-gratis"
 handle = "troca-gratis"
 type = "function"
-uid = "24e71357-b722-e37b-6b78-a54191c6bbc33ca54f12"
-description = "t:description"
+description = "Aplica desconto de produto e frete gratis para trocas"
 
   [[extensions.targeting]]
   target = "cart.lines.discounts.generate.run"

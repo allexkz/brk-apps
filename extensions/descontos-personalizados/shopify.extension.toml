@@ -1,0 +1,23 @@
+api_version = "2026-04"
+
+[[extensions]]
+name = "Descontos Personalizados"
+handle = "descontos-personalizados"
+type = "function"
+uid = "2a40d65a-5022-528f-9e39-e1b83763ce102adbe1e8"
+description = "Desconto de produto configurável por coleção (aplica % em pares de itens)"
+
+  [[extensions.targeting]]
+  target = "cart.lines.discounts.generate.run"
+  input_query = "src/cart_lines_discounts_generate_run.graphql"
+  export = "cart-lines-discounts-generate-run"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"
+
+  # Popula as variáveis do input query a partir do metafield de configuração
+  # do desconto. A chave `collectionIds` do JSON vira a variável $collectionIds.
+  [extensions.input.variables]
+  namespace = "$app:descontos-personalizados"
+  key = "config"

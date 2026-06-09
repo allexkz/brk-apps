@@ -1,0 +1,17 @@
+api_version = "2026-01"
+uid = "3300a60d-3294-2fdd-be3c-e792cdb20200a2241426"
+
+[[extensions]]
+name = "Retirada em Loja - Ordenacao"
+handle = "retirada-loja-ordenacao"
+type = "function"
+description = "Move a opcao Retirada em Loja para o fim da lista de fretes no checkout"
+
+  [[extensions.targeting]]
+  target = "cart.delivery-options.transform.run"
+  input_query = "src/cart_delivery_options_transform_run.graphql"
+  export = "cart-delivery-options-transform-run"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"

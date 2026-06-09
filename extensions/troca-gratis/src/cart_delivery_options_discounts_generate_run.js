@@ -6,8 +6,13 @@ import {
 } from "../generated/api";
 
 /**
- * @param {import("../generated/api").Input} input
- * @returns {import("../generated/api").CartDeliveryOptionsDiscountsGenerateRunResult}
+ * @typedef {import("../generated/api").Input} Input
+ * @typedef {import("../generated/api").CartDeliveryOptionsDiscountsGenerateRunResult} CartDeliveryOptionsDiscountsGenerateRunResult
+ */
+
+/**
+ * @param {Input} input
+ * @returns {CartDeliveryOptionsDiscountsGenerateRunResult}
  */
 export function cartDeliveryOptionsDiscountsGenerateRun(input) {
   if (!input.discount.discountClasses.includes(DiscountClass.Shipping)) {
@@ -25,13 +30,17 @@ export function cartDeliveryOptionsDiscountsGenerateRun(input) {
   const targets = [];
 
   for (const group of input.cart.deliveryGroups) {
-    for (const option of group.deliveryOptions) {
-      targets.push({
-        deliveryOption: {
-          handle: option.handle,
-        },
-      });
-    }
+    if (group.deliveryOptions.length === 0) continue;
+
+    const cheapest = group.deliveryOptions.reduce((min, opt) =>
+      parseFloat(opt.cost.amount) < parseFloat(min.cost.amount) ? opt : min
+    );
+
+    targets.push({
+      deliveryOption: {
+        handle: cheapest.handle,
+      },
+    });
   }
 
   if (targets.length === 0) {
@@ -45,7 +54,7 @@ export function cartDeliveryOptionsDiscountsGenerateRun(input) {
           selectionStrategy: DeliveryDiscountSelectionStrategy.All,
           candidates: [
             {
-              message: "TROCA GRÁTIS",
+              message: "Frete grátis para troca",
               targets,
               value: {
                 percentage: {

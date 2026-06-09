@@ -1,6 +1,7 @@
 # Environment Configuration
 .env
 .env.*
+.dev.vars
 
 # Dependency directory
 node_modules
@@ -28,3 +29,4 @@ extensions/*/dist
 .shopify/*
 .shopify.lock
 
+.vscode/*

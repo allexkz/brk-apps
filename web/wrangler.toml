@@ -1,0 +1,22 @@
+name = "brk-apps-fishing"
+main = "./worker.js"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat_v2"]
+
+[assets]
+directory = "./build/client"
+
+[vars]
+SHOPIFY_APP_URL = "https://brk-apps-fishing.allexadriel.workers.dev"
+
+# KV namespace for Shopify session storage
+# Create with: wrangler kv namespace create SESSIONS
+# Then update the id below
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "9702058e0ee54a27b3de4ff2e0c275f2"
+
+# Secrets (set via CLI, not here):
+# wrangler secret put SHOPIFY_API_KEY
+# wrangler secret put SHOPIFY_API_SECRET
+# wrangler secret put SCOPES

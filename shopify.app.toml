@@ -2,7 +2,7 @@
 
 client_id = "c3c912e271b1a63733aa09ab6b6378da"
 name = "BRK Apps (Fishing)"
-application_url = "https://localhost"
+application_url = "https://brk-apps-fishing.allexadriel.workers.dev"
 embedded = true
 
 [build]
@@ -13,9 +13,11 @@ api_version = "2026-01"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_discounts,write_discounts"
+scopes = "read_all_orders,read_analytics,read_checkouts,read_customers,read_delivery_customizations,read_discounts,read_fulfillments,read_inventory,read_marketing_events,read_orders,read_products,read_reports,read_returns,read_shipping,read_themes,read_validations,write_checkouts,write_delivery_customizations,write_discounts,write_products,write_shipping,write_validations"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ ]
+redirect_urls = [
+  "https://brk-apps-fishing.allexadriel.workers.dev/auth/callback"
+]

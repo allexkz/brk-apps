@@ -1,0 +1,1 @@
+import{default as f}from"./app.retirada-em-loja-BhNe9uL4.js";import"./index-DYhwQDk1.js";import"./components-CWy0M80_.js";import"./Page-Sz_DOyqV.js";import"./context-P0R1-uId.js";import"./InlineCode-CF-__7P5.js";export{f as default};
