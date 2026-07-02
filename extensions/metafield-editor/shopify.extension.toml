@@ -1,0 +1,11 @@
+api_version = "2026-04"
+uid = "e31c1188-8af0-d862-5de9-6c3ac030bb9c52da2544"
+
+[[extensions]]
+name = "Metafield Editor"
+handle = "metafield-editor"
+type = "ui_extension"
+
+  [[extensions.targeting]]
+  module = "./src/ActionExtension.jsx"
+  target = "admin.product-index.selection-action.render"

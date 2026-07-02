@@ -1,0 +1,11 @@
+{
+  "name": "metafield-editor",
+  "version": "0.0.1",
+  "license": "UNLICENSED",
+  "type": "module",
+  "dependencies": {
+    "@shopify/ui-extensions": "^2025.4.0",
+    "@preact/signals": "^1.0.0",
+    "preact": "^10.0.0"
+  }
+}

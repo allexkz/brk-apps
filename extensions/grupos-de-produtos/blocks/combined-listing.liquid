@@ -1,0 +1,210 @@
+{%- comment -%}
+  Combined Listing nativo (substitui o SA Variants / Variant King).
+  Resolve os produtos irmãos por ID via o metafield list.product_reference
+  `brk_groups.product_group` (à prova de mudança de handle — usa sib.url ao vivo)
+  e pega rótulo/cor de cada um no JSON `brk_groups.combined_listing` casando pelo id.
+  Cada swatch é um <a href> para o irmão — zero JS, carga instantânea.
+
+  Aparência do swatch é configurável via block.settings (tamanho, borda, cores,
+  rótulo). Os valores são injetados como CSS custom properties inline no elemento;
+  o CSS estático (assets/combined-listing.css) usa var(--brk-cl-*, fallback).
+{%- endcomment -%}
+
+{%- liquid
+  assign refs = product.metafields.brk_groups.product_group.value
+  assign cfg = product.metafields.brk_groups.combined_listing.value
+-%}
+
+{%- if refs and refs.size > 0 and cfg -%}
+  {{ 'combined-listing.css' | asset_url | stylesheet_tag }}
+
+  {%- capture brk_vars -%}
+    --brk-cl-size: {{ block.settings.swatch_size | default: 86 }}px;
+    --brk-cl-radius: {{ block.settings.border_radius | default: 0 }}px;
+    --brk-cl-border-w: {{ block.settings.border_width | default: 1 }}px;
+    --brk-cl-gap: {{ block.settings.gap | default: 4 }}px;
+    --brk-cl-margin-y: {{ block.settings.margin_y | default: 10 }}px;
+    --brk-cl-border: {{ block.settings.border_color | default: '#CFCFCF' }};
+    --brk-cl-selected: {{ block.settings.selected_color | default: '#085B47' }};
+    --brk-cl-selected-text: {{ block.settings.selected_text_color | default: '#FFFFFF' }};
+    --brk-cl-hover: {{ block.settings.hover_color | default: '#3A9E35' }};
+    --brk-cl-label: {{ block.settings.label_color | default: '#6A6A6A' }};
+    --brk-cl-label-size: {{ block.settings.label_size | default: 12 }}px;
+  {%- endcapture -%}
+
+  <brk-combined-listing class="brk-cl" data-group="{{ cfg.groupId }}" style="{{ brk_vars | strip_newlines }}">
+    {%- if block.settings.show_option_name and cfg.optionName != blank -%}
+      <span class="brk-cl__legend">{{ cfg.optionName }}</span>
+    {%- endif -%}
+
+    <ul class="brk-cl__list" role="list">
+      {%- for sib in refs -%}
+        {%- assign meta = cfg.items | where: 'id', sib.id | first -%}
+        {%- assign label = meta.value | default: sib.title -%}
+
+        {%- assign is_current = false -%}
+        {%- if sib.id == product.id -%}{%- assign is_current = true -%}{%- endif -%}
+
+        {%- liquid
+          assign img = sib.featured_image
+          case cfg.swatchSource
+            when 'second'
+              if sib.images[1] != blank
+                assign img = sib.images[1]
+              endif
+            when 'last'
+              assign img = sib.images.last
+          endcase
+        -%}
+
+        <li class="brk-cl__item{% if is_current %} is-selected{% endif %}{% unless sib.available %} is-unavailable{% endunless %}">
+          {%- capture inner -%}
+            {%- if cfg.swatchSource == 'custom' and meta.color != blank -%}
+              <span class="brk-cl__img" style="background-color: {{ meta.color }};"></span>
+            {%- elsif img -%}
+              <span class="brk-cl__img" style="background-image: url({{ img | image_url: width: 200, height: 200, crop: 'top' }});"></span>
+            {%- else -%}
+              <span class="brk-cl__img brk-cl__img--empty"></span>
+            {%- endif -%}
+            {%- if block.settings.show_label -%}
+              <span class="brk-cl__label"><span>{{ label | escape }}</span></span>
+            {%- endif -%}
+          {%- endcapture -%}
+
+          {%- if is_current -%}
+            <div class="brk-cl__swatch" aria-current="true" title="{{ label | escape }}">{{ inner }}</div>
+          {%- else -%}
+            <a class="brk-cl__swatch" href="{{ sib.url }}" title="{{ label | escape }}" aria-label="{{ sib.title | escape }}">{{ inner }}</a>
+          {%- endif -%}
+        </li>
+      {%- endfor -%}
+    </ul>
+  </brk-combined-listing>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Grupo de Variantes",
+  "target": "section",
+  "settings": [
+    {
+      "type": "header",
+      "content": "Conteúdo"
+    },
+    {
+      "type": "checkbox",
+      "id": "show_option_name",
+      "label": "Mostrar nome da opção (ex: \"Modelo:\")",
+      "default": true
+    },
+    {
+      "type": "checkbox",
+      "id": "show_label",
+      "label": "Mostrar rótulo embaixo do swatch",
+      "default": true
+    },
+    {
+      "type": "header",
+      "content": "Tamanho e forma"
+    },
+    {
+      "type": "range",
+      "id": "swatch_size",
+      "label": "Tamanho do swatch",
+      "min": 40,
+      "max": 140,
+      "step": 2,
+      "unit": "px",
+      "default": 86
+    },
+    {
+      "type": "range",
+      "id": "border_radius",
+      "label": "Arredondamento da borda",
+      "min": 0,
+      "max": 70,
+      "step": 1,
+      "unit": "px",
+      "default": 0
+    },
+    {
+      "type": "range",
+      "id": "border_width",
+      "label": "Espessura da borda",
+      "min": 0,
+      "max": 5,
+      "step": 1,
+      "unit": "px",
+      "default": 1
+    },
+    {
+      "type": "range",
+      "id": "gap",
+      "label": "Espaço entre swatches",
+      "min": 0,
+      "max": 24,
+      "step": 1,
+      "unit": "px",
+      "default": 4
+    },
+    {
+      "type": "range",
+      "id": "margin_y",
+      "label": "Margem vertical (topo/base)",
+      "min": 10,
+      "max": 60,
+      "step": 2,
+      "unit": "px",
+      "default": 10
+    },
+    {
+      "type": "header",
+      "content": "Cores"
+    },
+    {
+      "type": "color",
+      "id": "border_color",
+      "label": "Cor da borda",
+      "default": "#CFCFCF"
+    },
+    {
+      "type": "color",
+      "id": "selected_color",
+      "label": "Cor do selecionado (atual)",
+      "default": "#085B47"
+    },
+    {
+      "type": "color",
+      "id": "selected_text_color",
+      "label": "Cor do texto selecionado",
+      "default": "#FFFFFF"
+    },
+    {
+      "type": "color",
+      "id": "hover_color",
+      "label": "Cor no hover",
+      "default": "#3A9E35"
+    },
+    {
+      "type": "header",
+      "content": "Rótulo"
+    },
+    {
+      "type": "color",
+      "id": "label_color",
+      "label": "Cor do rótulo",
+      "default": "#6A6A6A"
+    },
+    {
+      "type": "range",
+      "id": "label_size",
+      "label": "Tamanho do rótulo",
+      "min": 10,
+      "max": 18,
+      "step": 1,
+      "unit": "px",
+      "default": 12
+    }
+  ]
+}
+{% endschema %}
