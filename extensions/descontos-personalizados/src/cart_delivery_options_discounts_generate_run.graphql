@@ -1,0 +1,29 @@
+query DeliveryInput($collectionIds: [ID!]) {
+  cart {
+    deliveryGroups {
+      deliveryOptions {
+        handle
+        title
+        cost {
+          amount
+        }
+      }
+    }
+    lines {
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          product {
+            inAnyCollection(ids: $collectionIds)
+          }
+        }
+      }
+    }
+  }
+  discount {
+    discountClasses
+    metafield(namespace: "$app:descontos-personalizados", key: "config") {
+      jsonValue
+    }
+  }
+}

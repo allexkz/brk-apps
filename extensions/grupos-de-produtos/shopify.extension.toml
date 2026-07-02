@@ -1,0 +1,9 @@
+api_version = "2026-01"
+uid = "1dcac1d5-fd75-668c-7a0e-94fa1b5ac397a5f267ca"
+
+# O `uid` é gerado automaticamente pela Shopify CLI no primeiro `shopify app dev`/`deploy`.
+
+[[extensions]]
+name = "Grupos de Produtos"
+handle = "grupos-de-produtos"
+type = "theme"
