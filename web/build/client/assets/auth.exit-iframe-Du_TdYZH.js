@@ -1,1 +1,0 @@
-import{b as r,r as s,j as a}from"./index-DYhwQDk1.js";function o(){const[t]=r(),e=t.get("exitIframe");return s.useEffect(()=>{e&&window.top&&(window.top.location.href=e)},[e]),a.jsx("div",{style:{padding:"2rem",fontFamily:"system-ui, sans-serif"},children:a.jsx("p",{children:"Redirecionando para autenticação..."})})}export{o as default};
