@@ -30,3 +30,8 @@ extensions/*/dist
 .shopify.lock
 
 .vscode/*
+
+# cloudflare wrangler 
+web/.wrangler
+web/build
+.wrangler/

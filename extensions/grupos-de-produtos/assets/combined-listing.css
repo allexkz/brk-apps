@@ -1,0 +1,48 @@
+/* Combined listing — base Polaroid (preset SA 94593) com knobs configuráveis
+   via CSS custom properties (--brk-cl-*) injetadas inline pelo block. */
+.brk-cl { display: block; max-width: 100%; margin-block: var(--brk-cl-margin-y, 10px); }
+.brk-cl__legend {
+  display: block; font-size: 14px; line-height: 1.2;
+  margin: 0 0 4px; text-transform: none; font-weight: inherit;
+}
+.brk-cl__list {
+  display: flex; flex-wrap: wrap; gap: var(--brk-cl-gap, 4px);
+  margin: 5px 0 0; padding: 0; list-style: none;
+}
+.brk-cl__item { margin: 0; }
+.brk-cl__swatch {
+  display: block; width: var(--brk-cl-size, 86px); box-sizing: border-box;
+  border: var(--brk-cl-border-w, 1px) solid var(--brk-cl-border, #CFCFCF);
+  border-radius: var(--brk-cl-radius, 0px);
+  background-color: #fff; overflow: hidden; padding-bottom: 5px;
+  text-decoration: none; transition: .3s ease-in-out;
+}
+.brk-cl__img {
+  display: block; width: 100%; aspect-ratio: 1 / 1;
+  background-position: center top; background-size: cover; background-repeat: no-repeat;
+}
+.brk-cl__img--empty { background-color: #f3f3f3; }
+.brk-cl__label {
+  display: flex; justify-content: center; width: 100%;
+  color: var(--brk-cl-label, #6A6A6A); padding: 5px 4px 0;
+  font-size: var(--brk-cl-label-size, 12px); text-transform: none;
+}
+.brk-cl__label span {
+  white-space: pre; overflow: hidden; text-overflow: ellipsis;
+  max-width: 90%; font-weight: 600; line-height: 120%;
+  margin: 0 !important; padding: 0 !important;
+}
+/* Selecionado = produto atual */
+.brk-cl__item.is-selected .brk-cl__swatch {
+  border-color: var(--brk-cl-selected, #085B47);
+  background-color: var(--brk-cl-selected, #085B47);
+}
+.brk-cl__item.is-selected .brk-cl__label { color: var(--brk-cl-selected-text, #FFFFFF); }
+/* Hover nos não selecionados */
+.brk-cl__item:not(.is-selected) .brk-cl__swatch:hover { border-color: var(--brk-cl-hover, #3A9E35); }
+/* Indisponível */
+.brk-cl__item.is-unavailable .brk-cl__swatch { position: relative; }
+.brk-cl__item.is-unavailable .brk-cl__swatch::after {
+  content: ""; position: absolute; inset: -1px; margin: auto;
+  background-color: #f8f8f8; opacity: .75; pointer-events: none;
+}

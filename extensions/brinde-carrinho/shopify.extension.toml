@@ -1,7 +1,0 @@
-api_version = "2026-01"
-uid = "a214c8c2-7796-693a-a676-3f9749e448fd269a6a05"
-
-[[extensions]]
-name = "Brinde Carrinho"
-handle = "brinde-carrinho"
-type = "theme"
