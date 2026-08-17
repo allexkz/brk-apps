@@ -1,0 +1,57 @@
+{%- comment -%}
+  BRK Bundles — app embed global.
+
+  Ativa (globalmente, nas configurações do tema → App embeds) o comportamento dos
+  bundles: adiciona os add-ons marcados ao carrinho com a line item property
+  `_brk_bundle` e exibe o popup pós add-to-cart para bundles em modo popup.
+
+  O markup/dados de cada bundle vêm do bloco "BRK Bundle (add-on)" colocado na
+  página de produto (scripts .brk-bundle-data). Este embed apenas injeta o JS e a
+  config global.
+{%- endcomment -%}
+
+{%- if block.settings.enabled and request.page_type == 'product' -%}
+  <script type="application/json" id="brk-bundles-config">
+    {
+      "productFormSelector": {{ block.settings.product_form_selector | default: 'form[action*="/cart/add"]' | json }},
+      "cartRefreshSelectors": {{ block.settings.cart_refresh_selectors | default: '' | json }},
+      "popupTitle": {{ block.settings.popup_title | default: 'Aproveite esta oferta!' | json }},
+      "popupAccept": {{ block.settings.popup_accept | default: 'Adicionar' | json }},
+      "popupDecline": {{ block.settings.popup_decline | default: 'Não, obrigado' | json }},
+      "moneyFormat": {{ shop.money_format | json }}
+    }
+  </script>
+  <script src="{{ 'bundle.js' | asset_url }}" defer="defer"></script>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "BRK Bundles (ativar)",
+  "target": "body",
+  "settings": [
+    {
+      "type": "checkbox",
+      "id": "enabled",
+      "label": "Ativar BRK Bundles",
+      "default": true
+    },
+    {
+      "type": "text",
+      "id": "product_form_selector",
+      "label": "Seletor do formulário de produto (add to cart)",
+      "info": "CSS do <form> de adicionar ao carrinho. Padrão cobre a maioria dos temas.",
+      "default": "form[action*=\"/cart/add\"]"
+    },
+    {
+      "type": "text",
+      "id": "cart_refresh_selectors",
+      "label": "Seletores para atualizar após adicionar (opcional)",
+      "info": "Deixe vazio para usar o comportamento padrão (recarregar drawer/contador do tema)."
+    },
+    { "type": "header", "content": "Popup pós add-to-cart" },
+    { "type": "text", "id": "popup_title", "label": "Título do popup", "default": "Aproveite esta oferta!" },
+    { "type": "text", "id": "popup_accept", "label": "Botão aceitar", "default": "Adicionar" },
+    { "type": "text", "id": "popup_decline", "label": "Botão recusar", "default": "Não, obrigado" }
+  ]
+}
+{% endschema %}

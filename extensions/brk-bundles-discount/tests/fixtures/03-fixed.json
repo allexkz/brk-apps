@@ -1,0 +1,44 @@
+{
+  "payload": {
+    "export": "cart-lines-discounts-generate-run",
+    "target": "cart.lines.discounts.generate.run",
+    "input": {
+      "cart": {
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/0",
+            "quantity": 2,
+            "bundle": null, "item": null, "trigger": null,
+            "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/111" } }
+          },
+          {
+            "id": "gid://shopify/CartLine/1",
+            "quantity": 2,
+            "bundle": { "value": "b3" }, "item": { "value": "999" }, "trigger": { "value": "111" },
+            "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/999" } }
+          }
+        ]
+      },
+      "discount": {
+        "discountClasses": ["PRODUCT"],
+        "metafield": { "jsonValue": { "bundles": { "b3": { "enabled": true, "items": { "999": { "mode": "fixed", "value": 10, "label": "R$10 OFF", "maxQty": 2 } } } } } }
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "productDiscountsAdd": {
+            "selectionStrategy": "ALL",
+            "candidates": [
+              {
+                "message": "R$10 OFF",
+                "targets": [{ "cartLine": { "id": "gid://shopify/CartLine/1", "quantity": 2 } }],
+                "value": { "fixedAmount": { "amount": "10.00", "appliesToEachItem": true } }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

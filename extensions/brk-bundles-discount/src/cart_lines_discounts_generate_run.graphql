@@ -1,0 +1,31 @@
+query Input {
+  discount {
+    discountClasses
+    metafield(namespace: "brk-bundles", key: "config") {
+      jsonValue
+    }
+  }
+  cart {
+    lines {
+      id
+      quantity
+      bundle: attribute(key: "_brk_bundle") {
+        value
+      }
+      item: attribute(key: "_brk_bundle_item") {
+        value
+      }
+      trigger: attribute(key: "_brk_bundle_trigger") {
+        value
+      }
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          product {
+            id
+          }
+        }
+      }
+    }
+  }
+}
