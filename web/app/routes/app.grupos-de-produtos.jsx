@@ -349,6 +349,57 @@ export const action = async ({ request, context }) => {
       return json({ success: true, action: "save", id });
     }
 
+    if (intent === "saveMany") {
+      const incoming = JSON.parse(formData.get("groups") || "[]");
+
+      const writes = []; // objetos metafieldsSet
+      const deletes = []; // gids a limpar
+      let savedGroups = 0;
+      let skippedGroups = 0;
+
+      for (const group of incoming) {
+        // pula silenciosamente os incompletos (o cliente já avisa quais foram)
+        if (!group.optionName || !group.products || group.products.length < 2) { skippedGroups++; continue; }
+        if (!group.products.every((p) => (p.value || "").trim() !== "")) { skippedGroups++; continue; }
+
+        let id = group.id;
+        if (!id) id = `g_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+        const status = ["active", "draft", "archived"].includes(group.status) ? group.status : "active";
+        const swatchSource = ["first", "second", "last", "custom"].includes(group.swatchSource) ? group.swatchSource : "first";
+
+        const { combined, groupRefs } = buildGroupPayloads(id, group.optionName, swatchSource, group.products);
+
+        // limpa produtos removidos de um grupo existente
+        const prev = groups.find((g) => g.id === id);
+        const prevGids = prev ? prev.products.map((p) => p.productGid) : [];
+        const currentGids = new Set(group.products.map((p) => p.productGid));
+        deletes.push(...prevGids.filter((gid) => !currentGids.has(gid)));
+
+        if (status === "active") {
+          writes.push(...groupMetafieldObjects(group.products, combined, groupRefs));
+        } else {
+          for (const p of group.products) deletes.push(p.productGid);
+        }
+
+        const entry = { id, name: group.name || id, optionName: group.optionName, status, swatchSource, products: group.products };
+        const i = groups.findIndex((g) => g.id === id);
+        if (i >= 0) groups[i] = entry; else groups.push(entry);
+        savedGroups++;
+      }
+
+      if (savedGroups === 0) {
+        return json({ success: false, error: "Nenhum grupo válido para salvar (cada grupo precisa de nome da opção, 2+ produtos e o valor de cada produto preenchido)." });
+      }
+
+      await setMetafieldsChunked(admin, writes);
+      await deleteGroupMetafields(admin, deletes);
+      const errs = await saveIndex(admin, shopId, groups);
+      if (errs.length) return json({ success: false, error: errs.map((e) => e.message).join(", ") });
+
+      return json({ success: true, action: "saveMany", savedGroups, skippedGroups });
+    }
+
     if (intent === "delete") {
       const id = formData.get("id");
       const target = groups.find((g) => g.id === id);
@@ -481,12 +532,48 @@ export const action = async ({ request, context }) => {
   }
 };
 
+// Gera e baixa um CSV a partir de uma lista de grupos (usado tanto p/ exportar
+// tudo quanto só os selecionados).
+function exportGroupsCSV(list, filename) {
+  const esc = (v) => {
+    const s = String(v ?? "");
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const header = ["group", "option_name", "status", "swatch_source", "product_handle", "value", "color"];
+  const lines = [header.join(",")];
+  for (const g of list) {
+    for (const p of g.products || []) {
+      lines.push([g.name || g.id, g.optionName, g.status, g.swatchSource, p.handle, p.value, p.color || ""].map(esc).join(","));
+    }
+  }
+  // BOM p/ Excel abrir acentos corretamente
+  const blob = new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 // ── Component ─────────────────────────────────────────────────────────────
 
 const STATUS_TONE = { active: "success", draft: "attention", archived: undefined };
 
+// Chave estável de UI para cada bloco do editor (grupos novos não têm id ainda).
+let _keySeq = 0;
+function nextKey() { return `blk_${++_keySeq}`; }
+
 function blankGroup() {
-  return { id: "", name: "", optionName: "", status: "active", swatchSource: "first", products: [] };
+  return { _key: nextKey(), id: "", name: "", optionName: "", status: "active", swatchSource: "first", products: [] };
+}
+
+// Um grupo é válido para salvar quando tem nome de opção, 2+ produtos e o
+// valor de cada produto preenchido.
+function isGroupValid(g) {
+  return (g.optionName || "").trim() !== "" &&
+    g.products.length >= 2 &&
+    g.products.every((p) => (p.value || "").trim() !== "");
 }
 
 export default function GruposDeProdutos() {
@@ -496,18 +583,36 @@ export default function GruposDeProdutos() {
   const navigation = useNavigation();
   const shopify = useAppBridge();
 
-  const [editing, setEditing] = useState(null); // null = lista; objeto = editor
+  const [editing, setEditing] = useState(null); // null = lista; array = editor (1+ grupos)
   const isSubmitting = navigation.state === "submitting";
 
-  const startNew = useCallback(() => setEditing(blankGroup()), []);
-  const startEdit = useCallback((g) => setEditing(JSON.parse(JSON.stringify(g))), []);
+  const startNew = useCallback(() => setEditing([blankGroup()]), []);
+  const startEdit = useCallback((g) => setEditing([{ ...JSON.parse(JSON.stringify(g)), _key: nextKey() }]), []);
   const cancel = useCallback(() => setEditing(null), []);
 
-  const handleAddProducts = useCallback(async () => {
+  // Helpers p/ mexer num grupo específico do editor (por _key).
+  const updateBlock = useCallback((key, updater) => {
+    setEditing((cur) => cur.map((g) => (g._key === key ? updater(g) : g)));
+  }, []);
+
+  const updateGroupField = useCallback((key, field, val) => {
+    updateBlock(key, (g) => ({ ...g, [field]: val }));
+  }, [updateBlock]);
+
+  const addGroupBlock = useCallback(() => setEditing((cur) => [...cur, blankGroup()]), []);
+
+  const removeGroupBlock = useCallback((key) => {
+    setEditing((cur) => {
+      const next = cur.filter((g) => g._key !== key);
+      return next.length ? next : null; // removeu o último → volta pra lista
+    });
+  }, []);
+
+  const handleAddProducts = useCallback(async (key) => {
     const picked = await shopify.resourcePicker({ type: "product", multiple: true, action: "select" });
     if (!picked || picked.length === 0) return;
-    setEditing((cur) => {
-      const existing = new Map(cur.products.map((p) => [p.productGid, p]));
+    updateBlock(key, (g) => {
+      const existing = new Map(g.products.map((p) => [p.productGid, p]));
       for (const p of picked) {
         if (existing.has(p.id)) continue;
         existing.set(p.id, {
@@ -519,25 +624,28 @@ export default function GruposDeProdutos() {
           color: "",
         });
       }
-      return { ...cur, products: Array.from(existing.values()) };
+      return { ...g, products: Array.from(existing.values()) };
     });
-  }, [shopify]);
+  }, [shopify, updateBlock]);
 
-  const updateProduct = useCallback((gid, field, val) => {
-    setEditing((cur) => ({
-      ...cur,
-      products: cur.products.map((p) => (p.productGid === gid ? { ...p, [field]: val } : p)),
+  const updateProduct = useCallback((key, gid, field, val) => {
+    updateBlock(key, (g) => ({
+      ...g,
+      products: g.products.map((p) => (p.productGid === gid ? { ...p, [field]: val } : p)),
     }));
-  }, []);
+  }, [updateBlock]);
 
-  const removeProduct = useCallback((gid) => {
-    setEditing((cur) => ({ ...cur, products: cur.products.filter((p) => p.productGid !== gid) }));
-  }, []);
+  const removeProduct = useCallback((key, gid) => {
+    updateBlock(key, (g) => ({ ...g, products: g.products.filter((p) => p.productGid !== gid) }));
+  }, [updateBlock]);
 
   const handleSave = useCallback(() => {
+    if (!editing) return;
+    const valid = editing.filter(isGroupValid);
+    if (valid.length === 0) return;
     const fd = new FormData();
-    fd.set("intent", "save");
-    fd.set("group", JSON.stringify(editing));
+    fd.set("intent", "saveMany");
+    fd.set("groups", JSON.stringify(valid));
     submit(fd, { method: "post" });
     setEditing(null);
   }, [editing, submit]);
@@ -546,25 +654,7 @@ export default function GruposDeProdutos() {
   const fileRef = useRef(null);
 
   const handleExport = useCallback(() => {
-    const esc = (v) => {
-      const s = String(v ?? "");
-      return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const header = ["group", "option_name", "status", "swatch_source", "product_handle", "value", "color"];
-    const lines = [header.join(",")];
-    for (const g of groups) {
-      for (const p of g.products || []) {
-        lines.push([g.name || g.id, g.optionName, g.status, g.swatchSource, p.handle, p.value, p.color || ""].map(esc).join(","));
-      }
-    }
-    // BOM p/ Excel abrir acentos corretamente
-    const blob = new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "grupos-de-produtos.csv";
-    a.click();
-    URL.revokeObjectURL(url);
+    exportGroupsCSV(groups, "grupos-de-produtos.csv");
   }, [groups]);
 
   const handleImportFile = useCallback((e) => {
@@ -581,21 +671,37 @@ export default function GruposDeProdutos() {
     e.target.value = ""; // permite reimportar o mesmo arquivo
   }, [submit]);
 
+  // ── Busca ──
+  const [query, setQuery] = useState("");
+  const filteredGroups = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return groups;
+    return groups.filter((g) =>
+      (g.name || "").toLowerCase().includes(q) ||
+      (g.optionName || "").toLowerCase().includes(q) ||
+      (g.id || "").toLowerCase().includes(q) ||
+      (g.products || []).some(
+        (p) => (p.title || "").toLowerCase().includes(q) || (p.handle || "").toLowerCase().includes(q)
+      )
+    );
+  }, [groups, query]);
+
   // ── Paginação + seleção múltipla (IndexTable) ──
   const [pageSize, setPageSize] = useState("25");
   const [page, setPage] = useState(0);
 
-  const pageSizeNum = pageSize === "all" ? Math.max(groups.length, 1) : Number(pageSize);
-  const pageCount = Math.max(1, Math.ceil(groups.length / pageSizeNum));
+  const pageSizeNum = pageSize === "all" ? Math.max(filteredGroups.length, 1) : Number(pageSize);
+  const pageCount = Math.max(1, Math.ceil(filteredGroups.length / pageSizeNum));
   const safePage = Math.min(page, pageCount - 1);
   const pageItems = useMemo(
-    () => groups.slice(safePage * pageSizeNum, safePage * pageSizeNum + pageSizeNum),
-    [groups, safePage, pageSizeNum]
+    () => filteredGroups.slice(safePage * pageSizeNum, safePage * pageSizeNum + pageSizeNum),
+    [filteredGroups, safePage, pageSizeNum]
   );
 
   const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } =
     useIndexResourceState(pageItems);
 
+  const changeQuery = useCallback((v) => { setQuery(v); setPage(0); clearSelection(); }, [clearSelection]);
   const changePageSize = useCallback((v) => { setPageSize(v); setPage(0); clearSelection(); }, [clearSelection]);
   const goPrev = useCallback(() => { setPage((p) => Math.max(0, p - 1)); clearSelection(); }, [clearSelection]);
   const goNext = useCallback(() => { setPage((p) => p + 1); clearSelection(); }, [clearSelection]);
@@ -609,129 +715,167 @@ export default function GruposDeProdutos() {
     clearSelection();
   }, [selectedResources, submit, clearSelection]);
 
-  const canSave = useMemo(() => {
-    if (!editing) return false;
-    return editing.optionName.trim() !== "" && editing.products.length >= 2 &&
-      editing.products.every((p) => p.value.trim() !== "");
-  }, [editing]);
+  const handleExportSelected = useCallback(() => {
+    if (selectedResources.length === 0) return;
+    const set = new Set(selectedResources);
+    const list = groups.filter((g) => set.has(g.id));
+    exportGroupsCSV(list, "grupos-selecionados.csv");
+  }, [selectedResources, groups]);
+
+  const validCount = useMemo(() => (editing ? editing.filter(isGroupValid).length : 0), [editing]);
+  const invalidCount = useMemo(() => (editing ? editing.length - validCount : 0), [editing, validCount]);
+  const canSave = validCount > 0;
 
   // ── Editor ──
   if (editing) {
-    const isCustom = editing.swatchSource === "custom";
+    const isEditingExisting = editing.length === 1 && editing[0].id;
+    const isMulti = editing.length > 1;
+    const title = isEditingExisting ? "Editar grupo" : isMulti ? "Novos grupos" : "Novo grupo";
+    const saveLabel = isMulti ? `Salvar ${validCount} grupo(s)` : "Salvar";
     return (
       <Page
-        title={editing.id ? "Editar grupo" : "Novo grupo"}
+        title={title}
         backAction={{ content: "Grupos", onAction: cancel }}
-        primaryAction={{ content: "Salvar", onAction: handleSave, disabled: !canSave, loading: isSubmitting }}
+        primaryAction={{ content: saveLabel, onAction: handleSave, disabled: !canSave, loading: isSubmitting }}
       >
         <BlockStack gap="500">
           {!canSave && (
             <Banner tone="info">
-              <p>Informe o <strong>nome da opção</strong>, adicione <strong>2+ produtos</strong> e preencha o <strong>valor</strong> de cada um.</p>
+              <p>Cada grupo precisa do <strong>nome da opção</strong>, <strong>2+ produtos</strong> e o <strong>valor</strong> de cada um.</p>
             </Banner>
           )}
-          <Layout>
-            <Layout.Section>
-              <Card>
-                <BlockStack gap="400">
-                  <TextField
-                    label="Nome do grupo (referência interna)"
-                    value={editing.name}
-                    onChange={(v) => setEditing((c) => ({ ...c, name: v }))}
-                    autoComplete="off"
-                    placeholder="Ex: C02615"
-                  />
-                  <TextField
-                    label="Nome da opção (visível na loja)"
-                    value={editing.optionName}
-                    onChange={(v) => setEditing((c) => ({ ...c, optionName: v }))}
-                    autoComplete="off"
-                    placeholder="Ex: Modelo:"
-                  />
-                </BlockStack>
-              </Card>
+          {canSave && invalidCount > 0 && (
+            <Banner tone="warning">
+              <p>{invalidCount} grupo(s) incompleto(s) serão <strong>ignorados</strong> ao salvar. Só {validCount} grupo(s) válido(s) serão gravados.</p>
+            </Banner>
+          )}
 
-              <Box paddingBlockStart="400">
-                <Card>
-                  <BlockStack gap="400">
+          {editing.map((grp, gi) => {
+            const isCustom = grp.swatchSource === "custom";
+            return (
+              <Box key={grp._key}>
+                <BlockStack gap="300">
+                  {isMulti && (
                     <InlineStack align="space-between" blockAlign="center">
-                      <Text as="h2" variant="headingMd">Produtos do grupo</Text>
-                      <Button onClick={handleAddProducts}>Adicionar produtos</Button>
+                      <InlineStack gap="200" blockAlign="center">
+                        <Text as="h2" variant="headingMd">{grp.name.trim() || `Grupo ${gi + 1}`}</Text>
+                        {!isGroupValid(grp) && <Badge tone="attention">Incompleto</Badge>}
+                      </InlineStack>
+                      <Button variant="plain" tone="critical" onClick={() => removeGroupBlock(grp._key)}>
+                        Remover grupo
+                      </Button>
                     </InlineStack>
+                  )}
+                  <Layout>
+                    <Layout.Section>
+                      <Card>
+                        <BlockStack gap="400">
+                          <TextField
+                            label="Nome do grupo (referência interna)"
+                            value={grp.name}
+                            onChange={(v) => updateGroupField(grp._key, "name", v)}
+                            autoComplete="off"
+                            placeholder="Ex: C02615"
+                          />
+                          <TextField
+                            label="Nome da opção (visível na loja)"
+                            value={grp.optionName}
+                            onChange={(v) => updateGroupField(grp._key, "optionName", v)}
+                            autoComplete="off"
+                            placeholder="Ex: Modelo:"
+                          />
+                        </BlockStack>
+                      </Card>
 
-                    {editing.products.length === 0 && (
-                      <Text as="p" tone="subdued">Nenhum produto. Clique em "Adicionar produtos".</Text>
-                    )}
+                      <Box paddingBlockStart="400">
+                        <Card>
+                          <BlockStack gap="400">
+                            <InlineStack align="space-between" blockAlign="center">
+                              <Text as="h2" variant="headingMd">Produtos do grupo</Text>
+                              <Button onClick={() => handleAddProducts(grp._key)}>Adicionar produtos</Button>
+                            </InlineStack>
 
-                    <BlockStack gap="300">
-                      {editing.products.map((p) => (
-                        <Box key={p.productGid} padding="300" borderWidth="025" borderColor="border" borderRadius="200">
-                          <InlineStack gap="400" blockAlign="center" wrap={false}>
-                            {p.image && <Thumbnail source={p.image} alt={p.title} size="small" />}
-                            <Box minWidth="0" width="100%">
-                              <BlockStack gap="200">
-                                <Text as="span" variant="bodyMd" truncate>{p.title}</Text>
-                                <InlineStack gap="300" wrap>
-                                  <Box minWidth="180px">
-                                    <TextField
-                                      label="Valor (ex: Masculino)"
-                                      labelHidden
-                                      value={p.value}
-                                      onChange={(v) => updateProduct(p.productGid, "value", v)}
-                                      autoComplete="off"
-                                      placeholder="Valor da opção"
-                                    />
-                                  </Box>
-                                  {isCustom && (
-                                    <Box minWidth="140px">
-                                      <TextField
-                                        label="Cor (hex)"
-                                        labelHidden
-                                        value={p.color}
-                                        onChange={(v) => updateProduct(p.productGid, "color", v)}
-                                        autoComplete="off"
-                                        placeholder="#000000"
-                                      />
+                            {grp.products.length === 0 && (
+                              <Text as="p" tone="subdued">Nenhum produto. Clique em "Adicionar produtos".</Text>
+                            )}
+
+                            <BlockStack gap="300">
+                              {grp.products.map((p) => (
+                                <Box key={p.productGid} padding="300" borderWidth="025" borderColor="border" borderRadius="200">
+                                  <InlineStack gap="400" blockAlign="center" wrap={false}>
+                                    {p.image && <Thumbnail source={p.image} alt={p.title} size="small" />}
+                                    <Box minWidth="0" width="100%">
+                                      <BlockStack gap="200">
+                                        <Text as="span" variant="bodyMd" truncate>{p.title}</Text>
+                                        <InlineStack gap="300" wrap>
+                                          <Box minWidth="180px">
+                                            <TextField
+                                              label="Valor (ex: Masculino)"
+                                              labelHidden
+                                              value={p.value}
+                                              onChange={(v) => updateProduct(grp._key, p.productGid, "value", v)}
+                                              autoComplete="off"
+                                              placeholder="Valor da opção"
+                                            />
+                                          </Box>
+                                          {isCustom && (
+                                            <Box minWidth="140px">
+                                              <TextField
+                                                label="Cor (hex)"
+                                                labelHidden
+                                                value={p.color}
+                                                onChange={(v) => updateProduct(grp._key, p.productGid, "color", v)}
+                                                autoComplete="off"
+                                                placeholder="#000000"
+                                              />
+                                            </Box>
+                                          )}
+                                        </InlineStack>
+                                      </BlockStack>
                                     </Box>
-                                  )}
-                                </InlineStack>
-                              </BlockStack>
-                            </Box>
-                            <Button variant="plain" tone="critical" onClick={() => removeProduct(p.productGid)}>
-                              Remover
-                            </Button>
-                          </InlineStack>
-                        </Box>
-                      ))}
-                    </BlockStack>
-                  </BlockStack>
-                </Card>
-              </Box>
-            </Layout.Section>
+                                    <Button variant="plain" tone="critical" onClick={() => removeProduct(grp._key, p.productGid)}>
+                                      Remover
+                                    </Button>
+                                  </InlineStack>
+                                </Box>
+                              ))}
+                            </BlockStack>
+                          </BlockStack>
+                        </Card>
+                      </Box>
+                    </Layout.Section>
 
-            <Layout.Section variant="oneThird">
-              <Card>
-                <BlockStack gap="400">
-                  <Select
-                    label="Status"
-                    options={STATUS_OPTIONS}
-                    value={editing.status}
-                    onChange={(v) => setEditing((c) => ({ ...c, status: v }))}
-                  />
-                  <Select
-                    label="Fonte da imagem do swatch"
-                    options={SWATCH_SOURCES}
-                    value={editing.swatchSource}
-                    onChange={(v) => setEditing((c) => ({ ...c, swatchSource: v }))}
-                  />
-                  <Divider />
-                  <Text as="p" variant="bodySm" tone="subdued">
-                    Só grupos <strong>Ativos</strong> aparecem na loja. Os swatches são renderizados nativamente pelo app block "Grupo de Variantes" no Product Information.
-                  </Text>
+                    <Layout.Section variant="oneThird">
+                      <Card>
+                        <BlockStack gap="400">
+                          <Select
+                            label="Status"
+                            options={STATUS_OPTIONS}
+                            value={grp.status}
+                            onChange={(v) => updateGroupField(grp._key, "status", v)}
+                          />
+                          <Select
+                            label="Fonte da imagem do swatch"
+                            options={SWATCH_SOURCES}
+                            value={grp.swatchSource}
+                            onChange={(v) => updateGroupField(grp._key, "swatchSource", v)}
+                          />
+                          <Divider />
+                          <Text as="p" variant="bodySm" tone="subdued">
+                            Só grupos <strong>Ativos</strong> aparecem na loja. Os swatches são renderizados nativamente pelo app block "Grupo de Variantes" no Product Information.
+                          </Text>
+                        </BlockStack>
+                      </Card>
+                    </Layout.Section>
+                  </Layout>
                 </BlockStack>
-              </Card>
-            </Layout.Section>
-          </Layout>
+              </Box>
+            );
+          })}
+
+          <Box paddingBlockStart="200">
+            <Button variant="primary" onClick={addGroupBlock}>Adicionar novo grupo</Button>
+          </Box>
         </BlockStack>
       </Page>
     );
@@ -741,6 +885,7 @@ export default function GruposDeProdutos() {
   const isImporting = isSubmitting && navigation.formData?.get("intent") === "import";
   return (
     <Page
+      fullWidth
       title="Grupos de Produtos"
       subtitle="Agrupe produtos relacionados (ex: Masculino / Feminino / Infantil) e mostre swatches clicáveis na página de produto — nativo, sem app externo."
       primaryAction={{ content: "Novo grupo", onAction: startNew }}
@@ -759,6 +904,13 @@ export default function GruposDeProdutos() {
       <BlockStack gap="500">
         {actionData?.success && actionData.action === "save" && (
           <Banner tone="success" title="Grupo salvo!" />
+        )}
+        {actionData?.success && actionData.action === "saveMany" && (
+          <Banner tone={actionData.skippedGroups > 0 ? "warning" : "success"} title={`${actionData.savedGroups} grupo(s) salvo(s).`}>
+            {actionData.skippedGroups > 0 && (
+              <Text as="p" variant="bodySm">{actionData.skippedGroups} grupo(s) incompleto(s) ignorado(s).</Text>
+            )}
+          </Banner>
         )}
         {actionData?.success && actionData.action === "delete" && (
           <Banner tone="success" title="Grupo excluído." />
@@ -803,20 +955,35 @@ export default function GruposDeProdutos() {
         ) : (
           <Card padding="0">
             <Box padding="300" borderBlockEndWidth="025" borderColor="border">
-              <InlineStack align="space-between" blockAlign="center">
-                <Text as="span" variant="bodySm" tone="subdued">
-                  {groups.length} grupo(s){selectedResources.length > 0 ? ` · ${selectedResources.length} selecionado(s)` : ""}
-                </Text>
-                <Box minWidth="190px">
-                  <Select
-                    label="Por página"
-                    labelInline
-                    options={PAGE_SIZE_OPTIONS}
-                    value={pageSize}
-                    onChange={changePageSize}
-                  />
-                </Box>
-              </InlineStack>
+              <BlockStack gap="300">
+                <TextField
+                  label="Buscar grupos"
+                  labelHidden
+                  value={query}
+                  onChange={changeQuery}
+                  autoComplete="off"
+                  placeholder="Buscar por nome do grupo, opção ou produto…"
+                  clearButton
+                  onClearButtonClick={() => changeQuery("")}
+                />
+                <InlineStack align="space-between" blockAlign="center">
+                  <Text as="span" variant="bodySm" tone="subdued">
+                    {query.trim()
+                      ? `${filteredGroups.length} de ${groups.length} grupo(s)`
+                      : `${groups.length} grupo(s)`}
+                    {selectedResources.length > 0 ? ` · ${selectedResources.length} selecionado(s)` : ""}
+                  </Text>
+                  <Box minWidth="190px">
+                    <Select
+                      label="Por página"
+                      labelInline
+                      options={PAGE_SIZE_OPTIONS}
+                      value={pageSize}
+                      onChange={changePageSize}
+                    />
+                  </Box>
+                </InlineStack>
+              </BlockStack>
             </Box>
             <IndexTable
               resourceName={{ singular: "grupo", plural: "grupos" }}
@@ -824,6 +991,7 @@ export default function GruposDeProdutos() {
               selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
               onSelectionChange={handleSelectionChange}
               bulkActions={[
+                { content: "Exportar selecionados", onAction: handleExportSelected },
                 { content: "Excluir selecionados", destructive: true, onAction: handleBulkDelete },
               ]}
               headings={[{ title: "Grupo" }, { title: "Opção" }, { title: "Produtos" }]}

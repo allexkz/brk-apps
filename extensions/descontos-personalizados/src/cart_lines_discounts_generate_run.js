@@ -40,6 +40,12 @@ export function cartLinesDiscountsGenerateRun(input) {
     return EMPTY;
   }
 
+  // Modo progressivo (faixas por quantidade) é uma campanha à parte. Configs
+  // antigas não têm `mode` e continuam caindo na lógica de pares abaixo.
+  if (config.mode === 'progressive') {
+    return runProgressive(cart, config);
+  }
+
   const percentage =
     typeof config.percentage === 'number' ? config.percentage : 20;
   if (percentage <= 0) {
@@ -93,6 +99,91 @@ export function cartLinesDiscountsGenerateRun(input) {
   if (targets.length === 0) {
     return EMPTY;
   }
+
+  return {
+    operations: [
+      {
+        productDiscountsAdd: {
+          selectionStrategy: ProductDiscountSelectionStrategy.All,
+          candidates: [
+            {
+              message: `${percentage}% OFF`,
+              targets,
+              value: { percentage: { value: percentage } },
+            },
+          ],
+        },
+      },
+    ],
+  };
+}
+
+/**
+ * Desconto PROGRESSIVO por coleção: quanto mais unidades elegíveis no carrinho,
+ * maior a % aplicada a TODAS as unidades elegíveis.
+ *
+ * A faixa vencedora é a de maior `minQty` cujo `minQty <= totalQty`. Acima da
+ * última faixa configurada, a maior faixa se mantém. Abaixo da menor, sem
+ * desconto.
+ *
+ * Configuração (metafield "$app:descontos-personalizados/config", JSON):
+ *   { "enabled": true, "mode": "progressive",
+ *     "collectionIds": ["gid://shopify/Collection/123"],
+ *     "tiers": [ { "minQty": 1, "percentage": 5 },
+ *                { "minQty": 2, "percentage": 10 },
+ *                { "minQty": 3, "percentage": 15 } ] }
+ *
+ * @param {RunInput["cart"]} cart
+ * @param {*} config
+ * @returns {CartLinesDiscountsGenerateRunResult}
+ */
+function runProgressive(cart, config) {
+  // Faixas válidas, ordenadas da menor para a maior quantidade.
+  const tiers = (Array.isArray(config.tiers) ? config.tiers : [])
+    .filter(
+      (t) =>
+        t &&
+        typeof t.minQty === 'number' &&
+        t.minQty >= 1 &&
+        typeof t.percentage === 'number' &&
+        t.percentage > 0,
+    )
+    .sort((a, b) => a.minQty - b.minQty);
+  if (tiers.length === 0) {
+    return EMPTY;
+  }
+
+  // Linhas elegíveis: variantes que pertencem a alguma coleção configurada.
+  const eligible = cart.lines.filter(
+    (line) =>
+      line.merchandise.__typename === 'ProductVariant' &&
+      line.merchandise.product?.inAnyCollection === true,
+  );
+  if (eligible.length === 0) {
+    return EMPTY;
+  }
+
+  const totalQty = eligible.reduce((sum, line) => sum + line.quantity, 0);
+
+  // Maior faixa cujo minQty ainda cabe na quantidade total.
+  let selected = null;
+  for (const tier of tiers) {
+    if (tier.minQty <= totalQty) {
+      selected = tier;
+    } else {
+      break;
+    }
+  }
+  if (!selected) {
+    return EMPTY;
+  }
+
+  const percentage = selected.percentage;
+
+  // Aplica a % a todas as unidades elegíveis.
+  const targets = eligible.map((line) => ({
+    cartLine: { id: line.id, quantity: line.quantity },
+  }));
 
   return {
     operations: [

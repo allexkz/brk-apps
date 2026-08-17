@@ -38,6 +38,19 @@ const METAFIELD_KEY = "config";
 const FUNCTION_TITLE = "Descontos Personalizados";
 const DISCOUNT_TITLE = "Descontos Personalizados";
 const SHIPPING_DISCOUNT_TITLE = "Frete Grátis por Coleção";
+const PROGRESSIVE_DISCOUNT_TITLE = "Desconto Progressivo por Coleção";
+
+// "promo-pares, black-friday" -> ["promo-pares", "black-friday"] (sem vazios/dup)
+function parseTags(csv) {
+  return [
+    ...new Set(
+      String(csv || "")
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean)
+    ),
+  ];
+}
 
 async function findFunction(admin) {
   const res = await admin.graphql(`
@@ -104,79 +117,71 @@ async function findShippingDiscount(admin) {
   )?.node;
 }
 
-// Observabilidade: pedidos recentes que tiveram um desconto AUTOMÁTICO de
-// frete aplicado. Function não consegue logar; o registro confiável vem dos
-// pedidos. Casamos por targetType SHIPPING_LINE + automático (independe do
-// título exibido, que pode ser a `message` da function) e olhamos tanto o
-// nível do pedido quanto as alocações da linha de frete.
-const isShippingAuto = (d) =>
-  d &&
-  d.__typename === "AutomaticDiscountApplication" &&
-  d.targetType === "SHIPPING_LINE";
-
-async function findShippingOrders(admin) {
+// Campanha progressiva: desconto de produto (classe PRODUCT) cujo % cresce com
+// a quantidade total de itens elegíveis. Desconto automático separado, com seu
+// próprio metafield de config (mode: "progressive" + tiers).
+async function findProgressiveDiscount(admin) {
   const res = await admin.graphql(
-    `query ShippingDiscountOrders {
-      orders(first: 50, sortKey: CREATED_AT, reverse: true) {
+    `query ($ns: String!, $key: String!) {
+      discountNodes(first: 50, query: "title:${PROGRESSIVE_DISCOUNT_TITLE}*") {
+        edges {
+          node {
+            id
+            discount {
+              ... on DiscountAutomaticApp { title status }
+            }
+            metafield(namespace: $ns, key: $key) { value }
+          }
+        }
+      }
+    }`,
+    { variables: { ns: METAFIELD_NAMESPACE, key: METAFIELD_KEY } }
+  );
+  const data = await res.json();
+  return data.data.discountNodes.edges.find(
+    (e) => e.node.discount?.title === PROGRESSIVE_DISCOUNT_TITLE
+  )?.node;
+}
+
+// Observabilidade: pedidos que receberam a(s) TAG(s) configurada(s) na campanha
+// de frete grátis. Só rastreamos por tag — sem tag setada, a lista fica vazia
+// (evita puxar todos os pedidos com frete grátis da loja).
+async function findTaggedShippingOrders(admin, tags) {
+  if (!Array.isArray(tags) || tags.length === 0) return [];
+
+  // Monta "tag:'a' OR tag:'b'". Aspas simples envolvem tags com espaço.
+  const q = tags
+    .map((t) => `tag:'${String(t).replace(/'/g, "")}'`)
+    .join(" OR ");
+
+  const res = await admin.graphql(
+    `query TaggedShippingOrders($q: String!) {
+      orders(first: 50, sortKey: CREATED_AT, reverse: true, query: $q) {
         nodes {
           id
           name
           createdAt
+          tags
           customer { displayName defaultEmailAddress { emailAddress } }
           totalShippingPriceSet { shopMoney { amount currencyCode } }
-          discountApplications(first: 15) {
-            nodes {
-              __typename
-              targetType
-              ... on AutomaticDiscountApplication { title }
-            }
-          }
-          shippingLines(first: 10) {
-            nodes {
-              discountAllocations {
-                discountApplication {
-                  __typename
-                  targetType
-                  ... on AutomaticDiscountApplication { title }
-                }
-              }
-            }
-          }
         }
       }
-    }`
+    }`,
+    { variables: { q } }
   );
   const data = await res.json();
-  const nodes = data.data?.orders?.nodes ?? [];
-
-  return nodes
-    .map((o) => {
-      let matched = (o.discountApplications?.nodes ?? []).find(isShippingAuto);
-      if (!matched) {
-        for (const sl of o.shippingLines?.nodes ?? []) {
-          const da = (sl.discountAllocations ?? []).find((a) =>
-            isShippingAuto(a.discountApplication)
-          );
-          if (da) {
-            matched = da.discountApplication;
-            break;
-          }
-        }
-      }
-      return matched ? { o, matched } : null;
-    })
-    .filter(Boolean)
-    .map(({ o, matched }) => ({
-      id: o.id,
-      name: o.name,
-      createdAt: o.createdAt,
-      customer:
-        o.customer?.displayName ||
-        o.customer?.defaultEmailAddress?.emailAddress ||
-        "Visitante",
-      discountTitle: matched.title || "Frete grátis",
-      shipping: o.totalShippingPriceSet?.shopMoney ?? null,
-    }));
+  const wanted = new Set(tags);
+  return (data.data?.orders?.nodes ?? []).map((o) => ({
+    id: o.id,
+    name: o.name,
+    createdAt: o.createdAt,
+    customer:
+      o.customer?.displayName ||
+      o.customer?.defaultEmailAddress?.emailAddress ||
+      "Visitante",
+    tags: (o.tags ?? []).filter((t) => wanted.has(t)),
+    shipping: o.totalShippingPriceSet?.shopMoney ?? null,
+  }));
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────
@@ -195,7 +200,18 @@ export const loader = async ({ request, context }) => {
   const shipping = await findShippingDiscount(admin);
   const shippingRaw = shipping?.metafield?.value;
   const shippingConfig = shippingRaw ? JSON.parse(shippingRaw) : null;
-  const shippingOrders = shipping ? await findShippingOrders(admin) : [];
+  const shippingTags = Array.isArray(shippingConfig?.orderTags)
+    ? shippingConfig.orderTags.filter(Boolean)
+    : [];
+  // Só puxa pedidos se houver tag configurada nesta campanha.
+  const shippingOrders = shippingTags.length
+    ? await findTaggedShippingOrders(admin, shippingTags)
+    : [];
+
+  // Campanha progressiva (desconto de produto por faixa de quantidade).
+  const progressive = await findProgressiveDiscount(admin);
+  const progressiveRaw = progressive?.metafield?.value;
+  const progressiveConfig = progressiveRaw ? JSON.parse(progressiveRaw) : null;
 
   return json({
     config,
@@ -208,6 +224,10 @@ export const loader = async ({ request, context }) => {
     shippingStartsAt: shipping?.discount?.startsAt ?? null,
     shippingEndsAt: shipping?.discount?.endsAt ?? null,
     shippingOrders,
+    shippingHasTags: shippingTags.length > 0,
+    progressiveConfig,
+    hasProgressive: Boolean(progressive),
+    progressiveStatus: progressive?.discount?.status ?? null,
   });
 };
 
@@ -220,12 +240,13 @@ export const action = async ({ request, context }) => {
     const formData = await request.formData();
     const intent = formData.get("intent");
 
-    const buildConfigValue = ({ enabled, percentage, collections }) =>
+    const buildConfigValue = ({ enabled, percentage, collections, orderTags }) =>
       JSON.stringify({
         enabled,
         percentage,
         collectionIds: collections.map((c) => c.id),
         collections,
+        orderTags: orderTags ?? [],
       });
 
     const upsertDiscount = async (configValue) => {
@@ -301,11 +322,12 @@ export const action = async ({ request, context }) => {
       return {};
     };
 
-    const buildShippingConfigValue = ({ enabled, collections }) =>
+    const buildShippingConfigValue = ({ enabled, collections, orderTags }) =>
       JSON.stringify({
         enabled,
         collectionIds: collections.map((c) => c.id),
         collections,
+        orderTags: orderTags ?? [],
       });
 
     const upsertShippingDiscount = async ({ configValue, startsAt, endsAt }) => {
@@ -385,10 +407,94 @@ export const action = async ({ request, context }) => {
       return {};
     };
 
+    const buildProgressiveConfigValue = ({ enabled, collections, tiers, orderTags }) =>
+      JSON.stringify({
+        enabled,
+        mode: "progressive",
+        collectionIds: collections.map((c) => c.id),
+        collections,
+        tiers,
+        orderTags: orderTags ?? [],
+      });
+
+    const upsertProgressiveDiscount = async (configValue) => {
+      const fn = await findFunction(admin);
+      const existing = await findProgressiveDiscount(admin);
+
+      if (!fn && !existing) {
+        return {
+          warning:
+            "Configuração não pôde ser aplicada: a function 'Descontos Personalizados' ainda não foi deployada. Rode `shopify app deploy`.",
+        };
+      }
+
+      const metafields = [
+        {
+          namespace: METAFIELD_NAMESPACE,
+          key: METAFIELD_KEY,
+          type: "json",
+          value: configValue,
+        },
+      ];
+
+      if (existing) {
+        const res = await admin.graphql(
+          `mutation discountAutomaticAppUpdate($id: ID!, $automaticAppDiscount: DiscountAutomaticAppInput!) {
+            discountAutomaticAppUpdate(id: $id, automaticAppDiscount: $automaticAppDiscount) {
+              userErrors { field message }
+            }
+          }`,
+          {
+            variables: {
+              id: existing.id,
+              automaticAppDiscount: { metafields },
+            },
+          }
+        );
+        const data = await res.json();
+        const errors = data.data.discountAutomaticAppUpdate.userErrors;
+        if (errors.length > 0) {
+          return { error: errors.map((e) => e.message).join(", ") };
+        }
+      } else {
+        const res = await admin.graphql(
+          `mutation discountAutomaticAppCreate($automaticAppDiscount: DiscountAutomaticAppInput!) {
+            discountAutomaticAppCreate(automaticAppDiscount: $automaticAppDiscount) {
+              automaticAppDiscount { discountId }
+              userErrors { field message }
+            }
+          }`,
+          {
+            variables: {
+              automaticAppDiscount: {
+                title: PROGRESSIVE_DISCOUNT_TITLE,
+                functionId: fn.id,
+                discountClasses: ["PRODUCT"],
+                startsAt: new Date().toISOString(),
+                combinesWith: {
+                  orderDiscounts: true,
+                  productDiscounts: true,
+                  shippingDiscounts: true,
+                },
+                metafields,
+              },
+            },
+          }
+        );
+        const data = await res.json();
+        const errors = data.data.discountAutomaticAppCreate.userErrors;
+        if (errors.length > 0) {
+          return { error: errors.map((e) => e.message).join(", ") };
+        }
+      }
+      return {};
+    };
+
     if (intent === "save") {
       const percentage = parseInt(formData.get("percentage"), 10);
       const collections = JSON.parse(formData.get("collections") || "[]");
       const enabled = formData.get("enabled") === "true";
+      const orderTags = parseTags(formData.get("orderTags"));
 
       if (!collections.length) {
         return json({ success: false, error: "Selecione pelo menos uma coleção." });
@@ -397,7 +503,7 @@ export const action = async ({ request, context }) => {
         return json({ success: false, error: "Informe uma porcentagem entre 1 e 100." });
       }
 
-      const configValue = buildConfigValue({ enabled, percentage, collections });
+      const configValue = buildConfigValue({ enabled, percentage, collections, orderTags });
       const result = await upsertDiscount(configValue);
       if (result.error) return json({ success: false, error: result.error });
       return json({ success: true, action: "save", warning: result.warning });
@@ -410,6 +516,7 @@ export const action = async ({ request, context }) => {
         enabled: newEnabled,
         percentage: currentConfig.percentage,
         collections: currentConfig.collections || [],
+        orderTags: currentConfig.orderTags || [],
       });
       const result = await upsertDiscount(configValue);
       if (result.error) return json({ success: false, error: result.error });
@@ -421,6 +528,7 @@ export const action = async ({ request, context }) => {
       const enabled = formData.get("enabled") === "true";
       const startsAt = formData.get("startsAt") || null;
       const endsAt = formData.get("endsAt") || null;
+      const orderTags = parseTags(formData.get("orderTags"));
 
       if (!collections.length) {
         return json({
@@ -429,7 +537,7 @@ export const action = async ({ request, context }) => {
         });
       }
 
-      const configValue = buildShippingConfigValue({ enabled, collections });
+      const configValue = buildShippingConfigValue({ enabled, collections, orderTags });
       const result = await upsertShippingDiscount({ configValue, startsAt, endsAt });
       if (result.error) return json({ success: false, error: result.error });
       return json({ success: true, action: "save-shipping", warning: result.warning });
@@ -441,12 +549,74 @@ export const action = async ({ request, context }) => {
       const configValue = buildShippingConfigValue({
         enabled: newEnabled,
         collections: currentConfig.collections || [],
+        orderTags: currentConfig.orderTags || [],
       });
       const result = await upsertShippingDiscount({ configValue });
       if (result.error) return json({ success: false, error: result.error });
       return json({
         success: true,
         action: "toggle-shipping",
+        enabled: newEnabled,
+        warning: result.warning,
+      });
+    }
+
+    if (intent === "save-progressive") {
+      const collections = JSON.parse(formData.get("collections") || "[]");
+      const enabled = formData.get("enabled") === "true";
+      const orderTags = parseTags(formData.get("orderTags"));
+      const rawTiers = JSON.parse(formData.get("tiers") || "[]");
+
+      // Sanitiza: minQty inteiro >= 1, percentage 1-100, ordenado por minQty.
+      const tiers = rawTiers
+        .map((t) => ({
+          minQty: parseInt(t.minQty, 10),
+          percentage: parseInt(t.percentage, 10),
+        }))
+        .filter(
+          (t) =>
+            Number.isInteger(t.minQty) &&
+            t.minQty >= 1 &&
+            Number.isInteger(t.percentage) &&
+            t.percentage > 0 &&
+            t.percentage <= 100
+        )
+        .sort((a, b) => a.minQty - b.minQty);
+
+      if (!collections.length) {
+        return json({
+          success: false,
+          error: "Selecione pelo menos uma coleção para o desconto progressivo.",
+        });
+      }
+      if (!tiers.length) {
+        return json({
+          success: false,
+          error:
+            "Configure pelo menos uma faixa válida (quantidade ≥ 1 e desconto entre 1 e 100%).",
+        });
+      }
+
+      const configValue = buildProgressiveConfigValue({ enabled, collections, tiers, orderTags });
+      const result = await upsertProgressiveDiscount(configValue);
+      if (result.error) return json({ success: false, error: result.error });
+      return json({ success: true, action: "save-progressive", warning: result.warning });
+    }
+
+    if (intent === "toggle-progressive") {
+      const currentConfig = JSON.parse(formData.get("currentConfig"));
+      const newEnabled = !currentConfig.enabled;
+      const configValue = buildProgressiveConfigValue({
+        enabled: newEnabled,
+        collections: currentConfig.collections || [],
+        tiers: currentConfig.tiers || [],
+        orderTags: currentConfig.orderTags || [],
+      });
+      const result = await upsertProgressiveDiscount(configValue);
+      if (result.error) return json({ success: false, error: result.error });
+      return json({
+        success: true,
+        action: "toggle-progressive",
         enabled: newEnabled,
         warning: result.warning,
       });
@@ -484,6 +654,10 @@ export default function Descontos() {
     shippingStartsAt,
     shippingEndsAt,
     shippingOrders,
+    shippingHasTags,
+    progressiveConfig,
+    hasProgressive,
+    progressiveStatus,
   } = useLoaderData();
   const actionData = useActionData();
   const submit = useSubmit();
@@ -497,12 +671,38 @@ export default function Descontos() {
   const [percentage, setPercentage] = useState(
     config ? String(config.percentage) : "20"
   );
+  const [tagsInput, setTagsInput] = useState(
+    (config?.orderTags ?? []).join(", ")
+  );
   const [shipColls, setShipColls] = useState(shippingConfig?.collections ?? []);
   const [shipEnabled, setShipEnabled] = useState(
     shippingConfig?.enabled ?? true
   );
   const [shipStart, setShipStart] = useState(isoToLocalInput(shippingStartsAt));
   const [shipEnd, setShipEnd] = useState(isoToLocalInput(shippingEndsAt));
+  const [shipTagsInput, setShipTagsInput] = useState(
+    (shippingConfig?.orderTags ?? []).join(", ")
+  );
+
+  // ── Desconto progressivo ────────────────────────────────────────────────
+  const [progColls, setProgColls] = useState(
+    progressiveConfig?.collections ?? []
+  );
+  const [tiers, setTiers] = useState(
+    progressiveConfig?.tiers?.length
+      ? progressiveConfig.tiers.map((t) => ({
+          minQty: String(t.minQty),
+          percentage: String(t.percentage),
+        }))
+      : [
+          { minQty: "1", percentage: "5" },
+          { minQty: "2", percentage: "10" },
+          { minQty: "3", percentage: "15" },
+        ]
+  );
+  const [progTagsInput, setProgTagsInput] = useState(
+    (progressiveConfig?.orderTags ?? []).join(", ")
+  );
 
   const handlePickCollections = useCallback(async () => {
     const selected = await shopify.resourcePicker({
@@ -533,8 +733,9 @@ export default function Descontos() {
     fd.set("percentage", String(pct));
     fd.set("collections", JSON.stringify(collections));
     fd.set("enabled", config?.enabled ? "true" : "false");
+    fd.set("orderTags", tagsInput);
     submit(fd, { method: "post" });
-  }, [collections, percentage, config, submit]);
+  }, [collections, percentage, config, tagsInput, submit]);
 
   const handleToggle = useCallback(() => {
     if (!config) return;
@@ -572,10 +773,11 @@ export default function Descontos() {
     fd.set("intent", "save-shipping");
     fd.set("collections", JSON.stringify(shipColls));
     fd.set("enabled", shipEnabled ? "true" : "false");
+    fd.set("orderTags", shipTagsInput);
     if (shipStart) fd.set("startsAt", new Date(shipStart).toISOString());
     if (shipEnd) fd.set("endsAt", new Date(shipEnd).toISOString());
     submit(fd, { method: "post" });
-  }, [shipColls, shipEnabled, shipStart, shipEnd, submit]);
+  }, [shipColls, shipEnabled, shipStart, shipEnd, shipTagsInput, submit]);
 
   const handleToggleShipping = useCallback(() => {
     if (!shippingConfig) return;
@@ -585,6 +787,83 @@ export default function Descontos() {
     submit(fd, { method: "post" });
   }, [shippingConfig, submit]);
 
+  // ── Desconto progressivo ────────────────────────────────────────────────
+  const handlePickProgColls = useCallback(async () => {
+    const selected = await shopify.resourcePicker({
+      type: "collection",
+      multiple: true,
+      action: "select",
+      selectionIds: progColls.map((c) => ({ id: c.id })),
+    });
+    if (!selected || selected.length === 0) return;
+    setProgColls(
+      selected.map((c) => ({
+        id: c.id,
+        title: c.title,
+        image: c.image?.originalSrc ?? c.image?.url ?? null,
+      }))
+    );
+  }, [shopify, progColls]);
+
+  const handleRemoveProgColl = useCallback((id) => {
+    setProgColls((prev) => prev.filter((c) => c.id !== id));
+  }, []);
+
+  const handleTierChange = useCallback((index, field, value) => {
+    setTiers((prev) =>
+      prev.map((t, i) => (i === index ? { ...t, [field]: value } : t))
+    );
+  }, []);
+
+  const handleAddTier = useCallback(() => {
+    setTiers((prev) => {
+      const lastQty = prev.length ? parseInt(prev[prev.length - 1].minQty, 10) : 0;
+      const nextQty = Number.isInteger(lastQty) ? lastQty + 1 : prev.length + 1;
+      return [...prev, { minQty: String(nextQty), percentage: "" }];
+    });
+  }, []);
+
+  const handleRemoveTier = useCallback((index) => {
+    setTiers((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const parsedTiers = tiers
+    .map((t) => ({
+      minQty: parseInt(t.minQty, 10),
+      percentage: parseInt(t.percentage, 10),
+    }))
+    .filter(
+      (t) =>
+        Number.isInteger(t.minQty) &&
+        t.minQty >= 1 &&
+        Number.isInteger(t.percentage) &&
+        t.percentage > 0 &&
+        t.percentage <= 100
+    )
+    .sort((a, b) => a.minQty - b.minQty);
+
+  const canSaveProgressive =
+    progColls.length > 0 && parsedTiers.length > 0 && !isSubmitting;
+
+  const handleSaveProgressive = useCallback(() => {
+    if (!progColls.length || parsedTiers.length === 0) return;
+    const fd = new FormData();
+    fd.set("intent", "save-progressive");
+    fd.set("collections", JSON.stringify(progColls));
+    fd.set("tiers", JSON.stringify(parsedTiers));
+    fd.set("enabled", progressiveConfig?.enabled ? "true" : "false");
+    fd.set("orderTags", progTagsInput);
+    submit(fd, { method: "post" });
+  }, [progColls, parsedTiers, progressiveConfig, progTagsInput, submit]);
+
+  const handleToggleProgressive = useCallback(() => {
+    if (!progressiveConfig) return;
+    const fd = new FormData();
+    fd.set("intent", "toggle-progressive");
+    fd.set("currentConfig", JSON.stringify(progressiveConfig));
+    submit(fd, { method: "post" });
+  }, [progressiveConfig, submit]);
+
   const isEnabled = Boolean(config?.enabled);
   const pctNum = parseInt(percentage, 10);
   const canSave =
@@ -592,6 +871,7 @@ export default function Descontos() {
 
   return (
     <Page
+      fullWidth
       title="Descontos Personalizados"
       subtitle="Aplica uma % de desconto a cada PAR de itens das coleções escolhidas. Em quantidade ímpar, a unidade mais barata fica sem desconto."
     >
@@ -710,6 +990,20 @@ export default function Descontos() {
                   max={100}
                   helpText="Aplicado às unidades que formam pares completos. Padrão: 20%."
                 />
+
+                <Divider />
+
+                <Text as="h2" variant="headingMd">
+                  Tags de pedido (opcional)
+                </Text>
+                <TextField
+                  label="Tags"
+                  value={tagsInput}
+                  onChange={setTagsInput}
+                  autoComplete="off"
+                  placeholder="ex.: promo-pares, black-friday"
+                  helpText="Separe por vírgula. Pedidos elegíveis a esta promo recebem estas tags. Deixe em branco para não rastrear."
+                />
               </BlockStack>
             </Card>
           </Layout.Section>
@@ -760,6 +1054,228 @@ export default function Descontos() {
             Salvar configuração
           </Button>
         </InlineStack>
+
+        <Divider />
+
+        {/* ── Desconto Progressivo por Coleção ───────────────────────── */}
+        <Text as="h2" variant="headingLg">
+          Desconto Progressivo por Coleção
+        </Text>
+        <Text as="p" tone="subdued">
+          Quanto mais unidades das coleções escolhidas o cliente tiver no
+          carrinho, maior a % de desconto — aplicada a TODOS os itens elegíveis.
+          A maior faixa se mantém acima do topo.
+        </Text>
+
+        {hasProgressive && progressiveConfig && (
+          <Banner
+            tone={progressiveConfig.enabled ? "success" : "warning"}
+            title={
+              progressiveConfig.enabled
+                ? "Desconto progressivo ativo"
+                : "Desconto progressivo desativado"
+            }
+          >
+            <InlineStack gap="300" blockAlign="center">
+              <Text as="p">
+                {progressiveConfig.enabled
+                  ? `${
+                      (progressiveConfig.tiers || []).length
+                    } faixa(s) em ${
+                      (progressiveConfig.collections || []).length
+                    } coleção(ões).`
+                  : "A campanha está salva mas não está aplicando descontos."}
+              </Text>
+              <Button
+                variant={progressiveConfig.enabled ? "plain" : "primary"}
+                tone={progressiveConfig.enabled ? "critical" : undefined}
+                onClick={handleToggleProgressive}
+                loading={
+                  isSubmitting &&
+                  navigation.formData?.get("intent") === "toggle-progressive"
+                }
+              >
+                {progressiveConfig.enabled ? "Desativar" : "Ativar"}
+              </Button>
+            </InlineStack>
+          </Banner>
+        )}
+
+        {actionData?.success && actionData.action === "save-progressive" && (
+          <Banner tone="success" title="Desconto progressivo salvo!">
+            {actionData.warning && <p>{actionData.warning}</p>}
+          </Banner>
+        )}
+
+        <Layout>
+          <Layout.Section>
+            <Card>
+              <BlockStack gap="400">
+                <Text as="h3" variant="headingMd">
+                  Coleções elegíveis
+                </Text>
+                <Text as="p" tone="subdued">
+                  As unidades de qualquer uma destas coleções somam para definir
+                  a faixa de desconto.
+                </Text>
+
+                {progColls.length > 0 && (
+                  <BlockStack gap="200">
+                    {progColls.map((c) => (
+                      <Box
+                        key={c.id}
+                        padding="300"
+                        borderWidth="025"
+                        borderColor="border"
+                        borderRadius="200"
+                      >
+                        <InlineStack gap="400" blockAlign="center" align="space-between">
+                          <InlineStack gap="300" blockAlign="center">
+                            {c.image && (
+                              <Thumbnail source={c.image} alt={c.title} size="small" />
+                            )}
+                            <Text as="span" variant="bodyMd">
+                              {c.title}
+                            </Text>
+                          </InlineStack>
+                          <Button
+                            variant="plain"
+                            tone="critical"
+                            onClick={() => handleRemoveProgColl(c.id)}
+                          >
+                            Remover
+                          </Button>
+                        </InlineStack>
+                      </Box>
+                    ))}
+                  </BlockStack>
+                )}
+
+                <Button onClick={handlePickProgColls}>
+                  {progColls.length > 0 ? "Editar coleções" : "Selecionar coleções"}
+                </Button>
+
+                <Divider />
+
+                <Text as="h3" variant="headingMd">
+                  Faixas de desconto
+                </Text>
+                <Text as="p" tone="subdued" variant="bodySm">
+                  A partir de N unidades elegíveis, aplica a % correspondente.
+                </Text>
+
+                <BlockStack gap="300">
+                  {tiers.map((t, i) => (
+                    <InlineStack key={i} gap="300" blockAlign="end">
+                      <Box minWidth="140px">
+                        <TextField
+                          label="A partir de (unidades)"
+                          type="number"
+                          value={t.minQty}
+                          onChange={(v) => handleTierChange(i, "minQty", v)}
+                          autoComplete="off"
+                          min={1}
+                        />
+                      </Box>
+                      <Box minWidth="140px">
+                        <TextField
+                          label="Desconto"
+                          type="number"
+                          value={t.percentage}
+                          onChange={(v) => handleTierChange(i, "percentage", v)}
+                          suffix="%"
+                          autoComplete="off"
+                          min={1}
+                          max={100}
+                        />
+                      </Box>
+                      <Button
+                        variant="plain"
+                        tone="critical"
+                        onClick={() => handleRemoveTier(i)}
+                        disabled={tiers.length <= 1}
+                      >
+                        Remover
+                      </Button>
+                    </InlineStack>
+                  ))}
+                </BlockStack>
+
+                <InlineStack>
+                  <Button onClick={handleAddTier}>Adicionar faixa</Button>
+                </InlineStack>
+
+                <Divider />
+
+                <Text as="h3" variant="headingMd">
+                  Tags de pedido (opcional)
+                </Text>
+                <TextField
+                  label="Tags"
+                  value={progTagsInput}
+                  onChange={setProgTagsInput}
+                  autoComplete="off"
+                  placeholder="ex.: promo-progressiva"
+                  helpText="Separe por vírgula. Pedidos elegíveis a esta promo recebem estas tags. Deixe em branco para não rastrear."
+                />
+
+                <InlineStack align="end">
+                  <Button
+                    variant="primary"
+                    onClick={handleSaveProgressive}
+                    loading={
+                      isSubmitting &&
+                      navigation.formData?.get("intent") === "save-progressive"
+                    }
+                    disabled={!canSaveProgressive}
+                  >
+                    Salvar desconto progressivo
+                  </Button>
+                </InlineStack>
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+
+          <Layout.Section variant="oneThird">
+            <Card>
+              <BlockStack gap="300">
+                <Text as="h3" variant="headingMd">
+                  Como funciona
+                </Text>
+                <Text as="p" variant="bodySm">
+                  1. Escolha as coleções participantes.
+                </Text>
+                <Text as="p" variant="bodySm">
+                  2. Defina as faixas (quantidade → %).
+                </Text>
+                <Text as="p" variant="bodySm">
+                  3. Salve e ative a campanha.
+                </Text>
+                <Divider />
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Ex.: 1 un → 5%, 2 un → 10%, 3+ un → 15%. Conta as unidades
+                  totais das coleções; a maior faixa se mantém acima do topo.
+                </Text>
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Evite usar a mesma coleção nesta campanha e na de pares — os
+                  dois descontos podem se somar no carrinho.
+                </Text>
+                {hasProgressive && (
+                  <InlineStack gap="200">
+                    <Text as="span" variant="bodySm">
+                      Status do desconto:
+                    </Text>
+                    <Badge
+                      tone={progressiveStatus === "ACTIVE" ? "success" : undefined}
+                    >
+                      {progressiveStatus ?? "—"}
+                    </Badge>
+                  </InlineStack>
+                )}
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        </Layout>
 
         <Divider />
 
@@ -886,6 +1402,20 @@ export default function Descontos() {
                   onChange={setShipEnabled}
                 />
 
+                <Divider />
+
+                <Text as="h3" variant="headingMd">
+                  Tags de pedido (opcional)
+                </Text>
+                <TextField
+                  label="Tags"
+                  value={shipTagsInput}
+                  onChange={setShipTagsInput}
+                  autoComplete="off"
+                  placeholder="ex.: frete-gratis-promo"
+                  helpText="Separe por vírgula. Pedidos elegíveis a esta promo recebem estas tags. Deixe em branco para não rastrear."
+                />
+
                 <InlineStack align="end">
                   <Button
                     variant="primary"
@@ -950,7 +1480,7 @@ export default function Descontos() {
           <BlockStack gap="400">
             <InlineStack align="space-between" blockAlign="center">
               <Text as="h3" variant="headingMd">
-                Pedidos com frete grátis ({shippingOrders?.length ?? 0})
+                Pedidos com a tag da campanha ({shippingOrders?.length ?? 0})
               </Text>
               <Button
                 onClick={() => revalidator.revalidate()}
@@ -960,24 +1490,25 @@ export default function Descontos() {
               </Button>
             </InlineStack>
             <Text as="p" tone="subdued" variant="bodySm">
-              Pedidos recentes que receberam o desconto de frete desta campanha.
+              Pedidos recentes que receberam a(s) tag(s) configurada(s) nesta
+              campanha de frete grátis.
             </Text>
             {shippingOrders && shippingOrders.length > 0 ? (
               <DataTable
                 columnContentTypes={["text", "text", "text", "text"]}
-                headings={["Pedido", "Cliente", "Data/Hora", "Desconto"]}
+                headings={["Pedido", "Cliente", "Data/Hora", "Tags"]}
                 rows={shippingOrders.map((o) => [
                   o.name,
                   o.customer,
                   new Date(o.createdAt).toLocaleString("pt-BR"),
-                  o.discountTitle,
+                  (o.tags || []).join(", "),
                 ])}
               />
             ) : (
               <Text as="p" tone="subdued">
-                {hasShipping
-                  ? "Nenhum pedido com frete grátis ainda."
-                  : "Crie a campanha de frete para começar a registrar pedidos."}
+                {!shippingHasTags
+                  ? "Defina uma tag na campanha de frete grátis acima para começar a rastrear os pedidos aqui."
+                  : "Nenhum pedido com essa(s) tag(s) ainda."}
               </Text>
             )}
           </BlockStack>

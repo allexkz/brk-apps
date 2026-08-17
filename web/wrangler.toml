@@ -16,7 +16,30 @@ SHOPIFY_APP_URL = "https://brk-apps-motors.allexadriel.workers.dev"
 binding = "SESSIONS"
 id = "a97c2751ab4c4b2f8c443ffcf087a1bf"
 
+# Durable Object (SQLite, disponível no Free) que roda o drain do Sankhya a partir de
+# São Paulo (locationHint "sam" no .get). Necessário porque a Cloudflare que protege a
+# API do Sankhya bloqueia requisições de fora do Brasil (o cron normal sai de Singapura
+# → 401). O alarme do DO se re-agenda sozinho a cada 15 min.
+[[durable_objects.bindings]]
+name = "SANKHYA_DRAINER"
+class_name = "SankhyaDrainer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SankhyaDrainer"]
+
 # Secrets (set via CLI, not here):
 # wrangler secret put SHOPIFY_API_KEY
 # wrangler secret put SHOPIFY_API_SECRET
 # wrangler secret put SCOPES
+# wrangler secret put CLICKUP_TOKEN
+# Sankhya (mesmos valores nas 3 lojas — 1 componente da solução "Shopify"):
+# wrangler secret put SANKHYA_CLIENT_ID
+# wrangler secret put SANKHYA_CLIENT_SECRET
+# wrangler secret put SANKHYA_CLIENT_XTOKEN
+
+# Cron (a cada 15 min): apenas ARMA o Durable Object (que faz o drain de São Paulo).
+# Não chama o Sankhya daqui (Singapura), que seria bloqueado. É rede de segurança —
+# o alarme do DO já se re-agenda sozinho.
+[triggers]
+crons = ["*/15 * * * *"]

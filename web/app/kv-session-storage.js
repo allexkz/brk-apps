@@ -29,7 +29,16 @@ export class KVSessionStorage {
     const kv = getKV();
     const key = SESSION_PREFIX + session.id;
     const data = session.toObject ? session.toObject() : session;
-    await kv.put(key, JSON.stringify(data));
+    const serialized = JSON.stringify(data);
+
+    // Idempotência: o framework Shopify (unstable_newEmbeddedAuthStrategy) chama
+    // storeSession em quase todo request do admin embarcado, mas a sessão offline
+    // raramente muda. Só gravamos se o conteúdo mudou de fato — leitura é ~ilimitada
+    // no free tier; PUT é o recurso escasso (1000/dia por CONTA, somando as 3 lojas).
+    const current = await kv.get(key);
+    if (current !== serialized) {
+      await kv.put(key, serialized);
+    }
 
     if (data.shop) {
       const indexKey = SHOP_INDEX_PREFIX + data.shop;

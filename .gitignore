@@ -18,6 +18,7 @@ logs
 # extensions build output
 extensions/*/build
 extensions/*/dist
+extensions/*/generated
 
 # lock files
 
