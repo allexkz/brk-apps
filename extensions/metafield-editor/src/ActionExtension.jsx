@@ -37,7 +37,7 @@ async function adminQuery(query, variables = {}) {
 async function fetchAllDefinitions() {
   const res = await adminQuery(
     `query {
-      metafieldDefinitions(ownerType: PRODUCT, first: 50) {
+      metafieldDefinitions(ownerType: PRODUCT, first: 250) {
         edges {
           node {
             id
@@ -231,7 +231,7 @@ function Extension() {
       const res = await adminQuery(
         `query GetMetafields($id: ID!) {
           product(id: $id) {
-            metafields(first: 100) {
+            metafields(first: 250) {
               edges { node { namespace key type value } }
             }
           }

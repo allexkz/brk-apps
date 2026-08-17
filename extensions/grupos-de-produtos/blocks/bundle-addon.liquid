@@ -1,0 +1,190 @@
+{%- comment -%}
+  BRK Bundles — bloco de add-on na página de produto.
+
+  Lê todos os bundles do shop metafield `brk_bundles.config` (JSON, PUBLIC_READ),
+  filtra os ativos que casam com o produto atual (por produtos / collections /
+  tags / metafield) e:
+    - emite um <script type="application/json" class="brk-bundle-data"> por bundle
+      casado (consumido por assets/bundle.js — vale para inline E popup);
+    - renderiza a UI inline quando bundle.display == 'inline'.
+
+  A adição ao carrinho (com a line item property `_brk_bundle`) e o popup são
+  tratados no JS do app embed (assets/bundle.js).
+
+  Config de cada bundle (shape gravado pela rota admin app.bundles.jsx):
+    { id, name, enabled, display: 'inline'|'popup', priority, exclusive, chooseMax,
+      title, subtitle,
+      targets: { type, productIds:[num], collectionIds:[num], tags:[str],
+                 metafield:{ namespace, key, value } },
+      addons: [ { productId, title, image, mode, value, label, maxQty, preselected,
+                  variants:[{ variantId, title, priceCents, available }] } ] }
+
+  Ordena por `priority` (desc). Um bundle `exclusive` de maior prioridade suprime os
+  de menor prioridade no mesmo produto. Cada add-on tem seu próprio desconto.
+{%- endcomment -%}
+
+{%- comment -%}
+  Índice por produto: `applies` já traz só os bundles que casam com este produto
+  (produtos/collections/tags — gravado pela rota admin). `dynamic` traz os bundles
+  por metafield (poucos), casados ao vivo aqui. Não varremos mais o config inteiro.
+{%- endcomment -%}
+{%- assign applied = product.metafields.brk_bundles.applies.value -%}
+{%- assign dyn = shop.metafields.brk_bundles.dynamic.value -%}
+{%- if applied and dyn -%}
+  {%- assign candidates = applied | concat: dyn -%}
+{%- elsif applied -%}
+  {%- assign candidates = applied -%}
+{%- elsif dyn -%}
+  {%- assign candidates = dyn -%}
+{%- endif -%}
+
+{%- if candidates and candidates.size > 0 -%}
+  {{ 'bundle.css' | asset_url | stylesheet_tag }}
+
+  {%- capture brk_bundle_vars -%}
+    --brk-bd-border: {{ block.settings.border_color | default: '#E1E3E5' }};
+    --brk-bd-radius: {{ block.settings.border_radius | default: 12 }}px;
+    --brk-bd-accent: {{ block.settings.accent_color | default: '#085B47' }};
+    --brk-bd-label-bg: {{ block.settings.label_bg | default: '#085B47' }};
+    --brk-bd-label-text: {{ block.settings.label_text_color | default: '#FFFFFF' }};
+    --brk-bd-title-size: {{ block.settings.title_size | default: 15 }}px;
+    --brk-bd-margin-y: {{ block.settings.margin_y | default: 16 }}px;
+  {%- endcapture -%}
+
+  {%- assign sorted = candidates | sort: 'priority' | reverse -%}
+  <brk-bundles class="brk-bd-wrap" data-product-id="{{ product.id }}" style="{{ brk_bundle_vars | strip_newlines }}">
+    {%- assign excl_active = false -%}
+    {%- assign excl_priority = 0 -%}
+    {%- for bundle in sorted -%}
+      {%- if bundle.enabled == false -%}{%- continue -%}{%- endif -%}
+      {%- if bundle.addons == blank or bundle.addons.size == 0 -%}{%- continue -%}{%- endif -%}
+
+      {%- comment -%} applies já vem casado; só metafield precisa casar ao vivo {%- endcomment -%}
+      {%- assign is_match = true -%}
+      {%- if bundle.targets.type == 'metafield' -%}
+        {%- assign is_match = false -%}
+        {%- assign mf = product.metafields[bundle.targets.metafield.namespace][bundle.targets.metafield.key] -%}
+        {%- if mf != blank -%}
+          {%- assign wanted = bundle.targets.metafield.value -%}
+          {%- if wanted == blank or mf == wanted or mf.value == wanted -%}{%- assign is_match = true -%}{%- endif -%}
+        {%- endif -%}
+      {%- endif -%}
+      {%- unless is_match -%}{%- continue -%}{%- endunless -%}
+
+      {%- comment -%} exclusivo de maior prioridade suprime os de menor prioridade {%- endcomment -%}
+      {%- if excl_active and bundle.priority < excl_priority -%}{%- continue -%}{%- endif -%}
+
+      {%- comment -%} Dados p/ o JS (inline e popup) {%- endcomment -%}
+      <script type="application/json" class="brk-bundle-data" data-bundle-id="{{ bundle.id }}">{{ bundle | json }}</script>
+
+      {%- if bundle.display == 'inline' -%}
+        <div class="brk-bd" data-bundle-id="{{ bundle.id }}" data-display="inline" data-choose-max="{{ bundle.chooseMax | default: 0 }}">
+          {%- if bundle.title != blank or bundle.subtitle != blank -%}
+            <div class="brk-bd__head">
+              <div>
+                {%- if bundle.title != blank -%}<p class="brk-bd__title">{{ bundle.title }}</p>{%- endif -%}
+                {%- if bundle.subtitle != blank -%}<p class="brk-bd__subtitle">{{ bundle.subtitle }}</p>{%- endif -%}
+              </div>
+            </div>
+          {%- endif -%}
+
+          <ul class="brk-bd__list" role="list">
+            {%- for addon in bundle.addons -%}
+              {%- assign sel = addon.variants | where: 'available', true | first -%}
+              {%- unless sel -%}{%- assign sel = addon.variants | first -%}{%- endunless -%}
+              {%- if sel == blank -%}{%- continue -%}{%- endif -%}
+
+              {%- comment -%} label + preço com o desconto DO ITEM {%- endcomment -%}
+              {%- assign lbl = addon.label | default: '' -%}
+              {%- if addon.mode == 'percent' -%}{%- assign lbl = lbl | replace: '{{brk_discount_percentage}}', addon.value -%}
+              {%- elsif addon.mode == 'fixed' -%}{%- assign lbl = lbl | replace: '{{brk_discount_flat}}', addon.value -%}{%- endif -%}
+
+              {%- assign base = sel.priceCents -%}
+              {%- assign final = base -%}
+              {%- if addon.mode == 'gift' -%}{%- assign final = 0 -%}
+              {%- elsif addon.mode == 'percent' -%}{%- assign disc = base | times: addon.value | divided_by: 100 -%}{%- assign final = base | minus: disc -%}
+              {%- elsif addon.mode == 'fixed' -%}{%- assign fixedc = addon.value | times: 100 -%}{%- assign final = base | minus: fixedc -%}{%- endif -%}
+              {%- if final < 0 -%}{%- assign final = 0 -%}{%- endif -%}
+
+              <li class="brk-bd__item" data-addon="{{ addon.productId }}" data-mode="{{ addon.mode }}" data-value="{{ addon.value }}">
+                <label class="brk-bd__row">
+                  <input
+                    type="checkbox"
+                    class="brk-bd__check"
+                    data-bundle-id="{{ bundle.id }}"
+                    data-item="{{ addon.productId }}"
+                    data-variant-id="{{ sel.variantId }}"
+                    {% if addon.preselected %}checked{% endif %}
+                  >
+                  {%- if addon.image != blank -%}
+                    <span class="brk-bd__img" style="background-image:url({{ addon.image }});"></span>
+                  {%- endif -%}
+                  <span class="brk-bd__info">
+                    <span class="brk-bd__name">{{ addon.title }}</span>
+                    <span class="brk-bd__price" data-base="{{ base }}">
+                      {%- if final != base -%}
+                        <s>{{ base | money }}</s> <strong>{{ final | money }}</strong>
+                      {%- else -%}
+                        {{ base | money }}
+                      {%- endif -%}
+                    </span>
+                    {%- if addon.variants.size > 1 -%}
+                      <span class="brk-bd__variants">
+                        {%- for v in addon.variants -%}
+                          <button type="button"
+                            class="brk-bd__pill{% if v.variantId == sel.variantId %} is-active{% endif %}{% unless v.available %} is-unavailable{% endunless %}"
+                            data-variant-id="{{ v.variantId }}" data-price="{{ v.priceCents }}"
+                            {% unless v.available %}disabled{% endunless %}>{{ v.title }}</button>
+                        {%- endfor -%}
+                      </span>
+                    {%- endif -%}
+                  </span>
+                  {%- if lbl != blank -%}<span class="brk-bd__label">{{ lbl }}</span>{%- endif -%}
+                </label>
+              </li>
+            {%- endfor -%}
+          </ul>
+        </div>
+      {%- endif -%}
+
+      {%- if bundle.exclusive -%}{%- assign excl_active = true -%}{%- assign excl_priority = bundle.priority -%}{%- endif -%}
+    {%- endfor -%}
+  </brk-bundles>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "BRK Bundle (add-on)",
+  "target": "section",
+  "settings": [
+    {
+      "type": "paragraph",
+      "content": "Renderiza os add-ons/upsell/brindes configurados no app BRK Apps que casam com este produto. Lembre de ativar o app embed \"BRK Bundles\" nas configurações do tema."
+    },
+    { "type": "header", "content": "Aparência" },
+    {
+      "type": "range",
+      "id": "title_size",
+      "label": "Tamanho do título",
+      "min": 12, "max": 22, "step": 1, "unit": "px", "default": 15
+    },
+    {
+      "type": "range",
+      "id": "border_radius",
+      "label": "Arredondamento da borda",
+      "min": 0, "max": 24, "step": 1, "unit": "px", "default": 12
+    },
+    {
+      "type": "range",
+      "id": "margin_y",
+      "label": "Margem vertical",
+      "min": 0, "max": 48, "step": 2, "unit": "px", "default": 16
+    },
+    { "type": "header", "content": "Cores" },
+    { "type": "color", "id": "border_color", "label": "Borda", "default": "#E1E3E5" },
+    { "type": "color", "id": "accent_color", "label": "Destaque (checkbox)", "default": "#085B47" },
+    { "type": "color", "id": "label_bg", "label": "Fundo da label", "default": "#085B47" },
+    { "type": "color", "id": "label_text_color", "label": "Texto da label", "default": "#FFFFFF" }
+  ]
+}
+{% endschema %}

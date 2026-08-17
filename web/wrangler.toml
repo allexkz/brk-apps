@@ -16,7 +16,45 @@ SHOPIFY_APP_URL = "https://brk-apps-agro.allexadriel.workers.dev"
 binding = "SESSIONS"
 id = "563b55214a8b44abbb9d16c9e12054da"
 
+# D1 database para tracking dos BRK Bundles (append-only: 1 linha por bundle-line
+# em pedidos que contêm bundles). Criar com:
+#   wrangler d1 create brk-bundles-agro
+# e colar o database_id retornado abaixo. Migração:
+#   wrangler d1 execute BUNDLES_DB --file=./migrations/0001_bundle_sales.sql            (remoto)
+#   wrangler d1 execute BUNDLES_DB --local --file=./migrations/0001_bundle_sales.sql     (dev local)
+[[d1_databases]]
+binding = "BUNDLES_DB"
+database_name = "brk-bundles-agro"
+database_id = "71ae51ce-5474-4de2-a662-0b3e42f3596b"
+
+# Durable Object (SQLite, disponível no Free) que roda o drain do Sankhya a partir de
+# São Paulo (locationHint "sam" no .get). Necessário porque a Cloudflare que protege a
+# API do Sankhya bloqueia requisições de fora do Brasil (o cron normal sai de Singapura
+# → 401). O alarme do DO se re-agenda sozinho a cada 15 min.
+[[durable_objects.bindings]]
+name = "SANKHYA_DRAINER"
+class_name = "SankhyaDrainer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SankhyaDrainer"]
+
 # Secrets (set via CLI, not here):
 # wrangler secret put SHOPIFY_API_KEY
 # wrangler secret put SHOPIFY_API_SECRET
 # wrangler secret put SCOPES
+# wrangler secret put CLICKUP_TOKEN
+# Sankhya (mesmos valores nas 3 lojas — 1 componente da solução "Shopify"):
+# wrangler secret put SANKHYA_CLIENT_ID
+# wrangler secret put SANKHYA_CLIENT_SECRET
+# wrangler secret put SANKHYA_CLIENT_XTOKEN
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# Cron (a cada 15 min): apenas ARMA o Durable Object (que faz o drain de São Paulo).
+# Não chama o Sankhya daqui (Singapura), que seria bloqueado. É rede de segurança —
+# o alarme do DO já se re-agenda sozinho.
+[triggers]
+crons = ["*/15 * * * *"]

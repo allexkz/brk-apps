@@ -1,0 +1,33 @@
+{
+  "payload": {
+    "export": "cart-validations-generate-run",
+    "target": "cart.validations.generate.run",
+    "input": {
+      "buyerJourney": { "step": "CART_INTERACTION" },
+      "cart": {
+        "lines": [
+          {
+            "quantity": 1,
+            "merchandise": { "__typename": "ProductVariant", "sku": "PE1198" },
+            "nome": null,
+            "local": null
+          }
+        ]
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "validationAdd": {
+            "errors": [
+              {
+                "message": "O item de personalizacao (nome na camisa) nao pode ser comprado separadamente. Use o botao \"Quero meu nome na Camisa\" na pagina do produto.",
+                "target": "$.cart"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

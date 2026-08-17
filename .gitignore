@@ -19,6 +19,10 @@ logs
 # extensions build output
 extensions/*/build
 extensions/*/dist
+extensions/*/generated
+
+# temporary data exports
+gpc-missing.json
 
 # lock files
 

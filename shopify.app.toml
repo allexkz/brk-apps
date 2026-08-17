@@ -11,9 +11,14 @@ automatically_update_urls_on_dev = true
 [webhooks]
 api_version = "2026-01"
 
+  # BRK Bundles: atribuição de vendas + tags de pedido
+  [[webhooks.subscriptions]]
+  topics = [ "orders/create" ]
+  uri = "/webhooks"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_all_orders,read_analytics,read_validations,write_validations,write_checkouts,read_checkouts,read_customers,write_customers,read_discounts,write_discounts,read_fulfillments,read_inventory,read_marketing_events,read_orders,read_products,write_products,read_reports,read_returns,read_themes,read_shipping,write_shipping,read_delivery_customizations,write_delivery_customizations,read_script_tags,write_script_tags,read_product_listings"
+scopes = "read_all_orders,read_analytics,read_validations,write_validations,write_checkouts,read_checkouts,read_customers,write_customers,read_discounts,write_discounts,read_fulfillments,read_inventory,read_marketing_events,read_orders,write_orders,read_products,write_products,read_reports,read_returns,read_themes,read_shipping,write_shipping,read_delivery_customizations,write_delivery_customizations,read_script_tags,write_script_tags,read_product_listings"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
