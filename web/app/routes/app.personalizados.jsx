@@ -324,6 +324,7 @@ export const action = async ({ request, context }) => {
 
     let created = 0;
     let skipped = 0;
+    let skippedExpired = 0;
     const errors = [];
 
     // Nº Sankhya dos selecionados: puxa fresco do Sankhya e PERSISTE no mapa durável
@@ -366,6 +367,9 @@ export const action = async ({ request, context }) => {
 
     for (const node of orders) {
       const od = buildOrderData(node, shopDomain);
+      // Pedido expirado (pagamento não concluído) nunca vira tarefa no ClickUp —
+      // vale inclusive para "Forçar reenvio". Pode continuar indo ao Sankhya.
+      if (od.expired) { skippedExpired++; continue; }
       if (!force && sent[od.id]) { skipped++; continue; }
       if (od.rawPersoCount === 0) { skipped++; continue; }
 
@@ -434,7 +438,7 @@ export const action = async ({ request, context }) => {
     const metaErrs = await saveSent(admin, shopId, sent);
     if (metaErrs.length) errors.push(metaErrs.map((e) => e.message).join(", "));
 
-    return json({ success: true, action: "send", created, skipped, errors });
+    return json({ success: true, action: "send", created, skipped, skippedExpired, errors });
   } catch (err) {
     if (err instanceof Response) throw err;
     console.error("[personalizados action]", err);
@@ -618,13 +622,16 @@ export default function Personalizados() {
     return (
       <IndexTable.Row id={o.id} key={o.id} position={index} selected={selectedResources.includes(o.id)}>
         <IndexTable.Cell>
-          <div
-            role="presentation"
-            onClick={(e) => { e.stopPropagation(); setActiveOrder(o); }}
-            onKeyDown={(e) => e.stopPropagation()}
-          >
-            <Button variant="plain" onClick={() => setActiveOrder(o)}>{o.name}</Button>
-          </div>
+          <InlineStack gap="150" blockAlign="center">
+            <div
+              role="presentation"
+              onClick={(e) => { e.stopPropagation(); setActiveOrder(o); }}
+              onKeyDown={(e) => e.stopPropagation()}
+            >
+              <Button variant="plain" onClick={() => setActiveOrder(o)}>{o.name}</Button>
+            </div>
+            {o.expired && <Badge tone="critical">Expirado</Badge>}
+          </InlineStack>
         </IndexTable.Cell>
         <IndexTable.Cell>
           {o.nunota != null ? <Text as="span" variant="bodyMd" fontWeight="semibold">{o.nunota}</Text> : "—"}
@@ -655,6 +662,8 @@ export default function Personalizados() {
               <Badge tone="success">Enviado</Badge>
               {sentInfo.url && <Link url={sentInfo.url} target="_blank">tarefa</Link>}
             </InlineStack>
+          ) : o.expired ? (
+            <Badge tone="critical">Expirado — não enviar</Badge>
           ) : (
             <Badge>Pendente</Badge>
           )}
@@ -740,6 +749,7 @@ export default function Personalizados() {
           <Banner tone={actionData.errors?.length ? "warning" : "success"} title={`${actionData.created} tarefa(s) criada(s) no ClickUp.`}>
             <BlockStack gap="100">
               {actionData.skipped > 0 && <Text as="p" variant="bodySm">{actionData.skipped} ignorado(s) (já enviados ou sem personalização).</Text>}
+              {actionData.skippedExpired > 0 && <Text as="p" variant="bodySm">{actionData.skippedExpired} bloqueado(s) por estarem expirados (não enviados ao ClickUp).</Text>}
               {actionData.errors?.length > 0 && <Text as="p" variant="bodySm">Erros: {actionData.errors.join(" · ")}</Text>}
             </BlockStack>
           </Banner>
@@ -909,7 +919,12 @@ export default function Personalizados() {
                 {activeOrder.variacao.map((v) => <Badge key={v} tone={VARIACAO_TONE[v]}>{v}</Badge>)}
                 {sellerByOrder[activeOrder.id] && <Badge tone="info">Vendedor: {sellerByOrder[activeOrder.id]}</Badge>}
                 {activeOrder.hasFull && <Badge tone="critical">Envio Imediato (FULL)</Badge>}
-                {sent[activeOrder.id] ? <Badge tone="success">ClickUp: enviado</Badge> : <Badge>ClickUp: pendente</Badge>}
+                {activeOrder.expired && <Badge tone="critical">Expirado</Badge>}
+                {sent[activeOrder.id]
+                  ? <Badge tone="success">ClickUp: enviado</Badge>
+                  : activeOrder.expired
+                    ? <Badge tone="critical">ClickUp: bloqueado (expirado)</Badge>
+                    : <Badge>ClickUp: pendente</Badge>}
                 {sent[activeOrder.id]?.url && <Link url={sent[activeOrder.id].url} target="_blank">tarefa no ClickUp</Link>}
                 {(() => {
                   const st = sankhyaStatus[activeOrder.legacyId];
