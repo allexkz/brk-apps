@@ -152,6 +152,10 @@ export function buildOrderData(order, shopDomain) {
     createdAt: order.createdAt,
     note: order.note || "",
     tags: order.tags || [],
+    // Status financeiro Shopify. "EXPIRED" = pagamento (Pix/boleto) expirou sem
+    // ser pago — pode gravar no Sankhya, mas NÃO deve virar tarefa no ClickUp.
+    financialStatus: order.displayFinancialStatus || null,
+    expired: order.displayFinancialStatus === "EXPIRED",
     customer: order.customer?.displayName || "",
     persoCount: persos.length,
     rawPersoCount: persosAll.length,
@@ -203,6 +207,7 @@ const ORDER_FIELDS = `
   createdAt
   note
   tags
+  displayFinancialStatus
   customer { displayName }
   lineItems(first: 100) {
     edges {

@@ -23,11 +23,7 @@ export default function App() {
         <Link to="/app/trocas" rel="home">Trocas</Link>
         <Link to="/app/grupos-de-produtos">Grupos de Produtos</Link>
         <Link to="/app/personalizados">Personalizados</Link>
-        <Link to="/app/brinde-carrinho">Brinde Carrinho</Link>
         <Link to="/app/bundles">BRK Bundles</Link>
-        <Link to="/app/retirada-em-loja">Retirada em Loja</Link>
-        <Link to="/app/limite-endereco">Limite Endereco</Link>
-        <Link to="/app/embaralhar">Embaralhar Coleção</Link>
         <Link to="/app/descontos">Descontos</Link>
       </NavMenu>
       <Outlet />
