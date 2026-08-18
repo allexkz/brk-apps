@@ -397,11 +397,21 @@ export const action = async ({ request, context }) => {
         custom_fields.push({ id: canalField.id, value: [canalOptId] });
       }
 
-      // Pedido de vendedor: descrição vem da nota do pedido e atribuímos a label
-      // "Vendedores E-commerce" à option correspondente ao vendedor.
-      let description = od.description;
-      if (seller) {
+      // Descrição: com atributos estruturados (site OU block do vendedor) usa os
+      // blocos estruturados — igual aos outros pedidos. Só o vendedor no jeito
+      // ANTIGO (personalização na nota, sem atributos) usa a nota.
+      let description;
+      if (od.hasAttributes) {
+        description = od.description;
+      } else if (seller) {
         description = od.note.trim() || od.description || "(pedido de vendedor sem nota)";
+      } else {
+        description = od.description;
+      }
+
+      // Atribuição do vendedor: seta a label "Vendedores E-commerce" (mesmo com
+      // título/descrição normais), para saber quem vendeu.
+      if (seller) {
         if (vendedorField) {
           const optId = clickupOptionId(vendedorField, seller.name);
           if (optId) {
@@ -414,11 +424,9 @@ export const action = async ({ request, context }) => {
         }
       }
 
-      // Título: pedido normal = "Pedido {NUNOTA}" (fallback pro #pedido se ainda não
-      // sincronizou no Sankhya); venda de vendedor = texto fixo. A loja vai no "Canal".
-      const taskName = seller
-        ? "Pedido Personalizado (Vendedor Ecommerce)"
-        : `Pedido ${nunota ?? od.name}`;
+      // Título: sempre "Pedido {NUNOTA}" (fallback pro #pedido se ainda não
+      // sincronizou no Sankhya). O vendedor vai no campo "Vendedores E-commerce".
+      const taskName = `Pedido ${nunota ?? od.name}`;
       const payload = {
         name: taskName,
         status: CU_STATUS,
