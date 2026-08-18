@@ -449,7 +449,10 @@ export async function ingestPersoOrder(env, kv, shop, perso) {
   // Já gravado: idempotente, não mexe (não sobrescreve edição manual posterior no Sankhya).
   if (status[id]?.status === "sent") return;
 
-  if (perso.seller) {
+  // Vendedor no jeito ANTIGO (personalização na nota, sem atributos estruturados):
+  // mantém "seller" (manual). COM atributos (block/site): flui normal, guardando o
+  // nome do vendedor apenas para exibição/atribuição.
+  if (perso.seller && !perso.personalizations?.length) {
     await updateSankhyaStatus(kv, shop, { [id]: { name: perso.name, status: "seller", retry: false, seller: perso.seller, personalizations: [], at: nowISO() } });
     return;
   }
@@ -459,7 +462,7 @@ export async function ingestPersoOrder(env, kv, shop, perso) {
     return;
   }
 
-  await updateSankhyaStatus(kv, shop, { [id]: { name: perso.name, status: "pending", retry: true, reason: null, personalizations: perso.personalizations.map(slimPerso), at: nowISO() } });
+  await updateSankhyaStatus(kv, shop, { [id]: { name: perso.name, status: "pending", retry: true, reason: null, seller: perso.seller || null, personalizations: perso.personalizations.map(slimPerso), at: nowISO() } });
 
   try {
     await processPersoJobs(env, kv, shop, [id]);
@@ -500,7 +503,9 @@ export async function reprocessOrders(env, kv, shop, orderDatas, sellers) {
   for (const od of orderDatas || []) {
     if (!od.legacyId) continue;
     const seller = findSellerForTags(od.tags, sellers);
-    if (seller) {
+    // Vendedor SEM atributos estruturados (nota) → "seller" manual. COM atributos
+    // (block/site) → flui normal, guardando o nome do vendedor.
+    if (seller && !od.personalizations?.length) {
       updates[od.legacyId] = { name: od.name, status: "seller", retry: false, seller: seller.name, personalizations: [], at: nowISO() };
       sellerCount++;
       continue;
@@ -511,7 +516,7 @@ export async function reprocessOrders(env, kv, shop, orderDatas, sellers) {
       continue;
     }
     // Força reprocesso: limpa estado terminal e marca para processar agora.
-    updates[od.legacyId] = { ...(status[od.legacyId] || {}), name: od.name, status: "pending", retry: true, reason: null, personalizations: od.personalizations.map(slimPerso), at: nowISO() };
+    updates[od.legacyId] = { ...(status[od.legacyId] || {}), name: od.name, status: "pending", retry: true, reason: null, seller: seller?.name || null, personalizations: od.personalizations.map(slimPerso), at: nowISO() };
     targets.push(od.legacyId);
   }
   await updateSankhyaStatus(kv, shop, updates);
