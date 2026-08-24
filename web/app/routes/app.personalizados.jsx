@@ -40,6 +40,7 @@ import {
   buildOrderData,
   buildPersoQuery,
   buildOrdersPayload,
+  mergePersoOrders,
   loadNunotas,
   saveNunotas,
   loadSankhyaStatus,
@@ -151,23 +152,41 @@ function clickupOptionId(field, optionName) {
 
 // ── Loader ──
 
-// Cache do fetch pesado (paginação de todos os pedidos + lookup de FULL) em KV, com
-// stale-while-revalidate: a dashboard SEMPRE abre com os dados persistidos e, se
-// estiverem velhos, o worker refaz o fetch em segundo plano para a próxima visita.
+// Cache do payload em KV (persistido, sem TTL) + atualização INCREMENTAL por janela:
+// a dashboard SEMPRE abre com os dados persistidos e, ao atualizar, buscamos só os
+// pedidos da janela recente (created_at) e mesclamos por legacyId no cache. Nunca
+// re-paginamos os ~2 meses inteiros — isso estourava o teto de subrequests do Worker
+// (50/invocação no plano Free), derrubando o "Atualizar" com Application Error.
 const ORDERS_REVALIDATE_AFTER = 300; // s: idade a partir da qual revalida em background
 // (5 min: cada revalidação regrava o cache no KV — 1 PUT. Como PUT é o recurso escasso do
 // free tier, revalidamos com menos frequência; a dashboard segue abrindo instantânea via
 // cache, e o botão "Atualizar" (?refresh=1) força o fetch imediato quando preciso.)
 
+const DAY_MS = 86400000;
+const REFRESH_WINDOW_CAP_DAYS = 30; // teto da janela padrão (trava de subrequests)
+const toShopDate = (ms) => new Date(ms).toISOString().slice(0, 10); // YYYY-MM-DD
+
+// Início padrão da janela: desde a última busca bem-sucedida (com 1 dia de folga p/ pegar
+// o que entrou logo após), limitado a REFRESH_WINDOW_CAP_DAYS atrás. Sem cache anterior
+// (cold start), volta o teto inteiro.
+function defaultSince(fetchedAt) {
+  const floorMs = Date.now() - REFRESH_WINDOW_CAP_DAYS * DAY_MS;
+  const baseMs = fetchedAt ? fetchedAt - DAY_MS : floorMs;
+  return toShopDate(Math.max(baseMs, floorMs));
+}
+
 export const loader = async ({ request, context }) => {
   const shopify = getShopify(context.env);
   const { admin, session } = await shopify.authenticate.admin(request);
 
-  // `?refresh=1` ignora o cache e refaz o fetch pesado na hora.
-  const forceRefresh = new URL(request.url).searchParams.has("refresh");
+  // `?refresh=1` atualiza a janela recente e mescla no cache. `since`/`until` (YYYY-MM-DD)
+  // = período personalizado; ausentes → janela padrão (desde a última busca bem-sucedida).
+  const url = new URL(request.url);
+  const forceRefresh = url.searchParams.has("refresh");
+  const sinceParam = url.searchParams.get("since");
+  const untilParam = url.searchParams.get("until");
 
   const { sellers } = await loadSellers(admin);
-  const ordersQuery = buildPersoQuery(sellers);
 
   // Status "enviado" ao ClickUp (fresco): usado para puxar o Nº Sankhya SÓ dos pendentes.
   const { sent } = await loadSent(admin);
@@ -176,37 +195,69 @@ export const loader = async ({ request, context }) => {
   const kvKey = `personalizados:orders:${session.shop}`;
   const waitUntil = context.cloudflare?.ctx?.waitUntil?.bind(context.cloudflare.ctx);
 
-  const refetchAndStore = async () => {
-    const fresh = { ...(await buildOrdersPayload(admin, ordersQuery)), fetchedAt: Date.now() };
-    if (kv) await kv.put(kvKey, JSON.stringify(fresh));
-    return fresh;
-  };
-
-  let payload = null;
-  if (kv && !forceRefresh) {
-    try {
-      payload = await kv.get(kvKey, "json");
-    } catch {
-      payload = null;
-    }
+  // Base de merge: SEMPRE o payload em cache (persistido). Nunca re-paginamos tudo.
+  let cached = null;
+  if (kv) {
+    try { cached = await kv.get(kvKey, "json"); } catch { cached = null; }
   }
 
-  if (payload) {
-    // Serve o cache imediatamente; se estiver velho, revalida em background.
-    const ageMs = Date.now() - (payload.fetchedAt || 0);
-    if (ageMs > ORDERS_REVALIDATE_AFTER * 1000 && waitUntil) {
-      waitUntil(refetchAndStore().catch((e) => console.error("[personalizados revalidate]", e)));
+  // Busca a janela [since, until] e mescla na base; grava o resultado no KV. Limita a
+  // MAX_ORDERS (mantém os mais novos) pra não inflar o payload no KV indefinidamente.
+  const buildWindow = async ({ since, until = null, base }) => {
+    const windowed = await buildOrdersPayload(admin, buildPersoQuery(sellers, { since, until }));
+    const mergedFull = base?.orders ? mergePersoOrders(base.orders, windowed.orders) : windowed.orders;
+    const orders = mergedFull.slice(0, MAX_ORDERS);
+    const next = {
+      orders,
+      truncated: windowed.truncated || mergedFull.length > MAX_ORDERS,
+      fetchedAt: Date.now(),
+      lastWindow: { since, until: until || toShopDate(Date.now()) },
+    };
+    if (kv) await kv.put(kvKey, JSON.stringify(next));
+    return next;
+  };
+
+  let payload = cached;
+  let refreshError = null;
+
+  if (forceRefresh) {
+    // Atualização manual (botão padrão ou período personalizado): janela + merge.
+    try {
+      const since = sinceParam || defaultSince(cached?.fetchedAt);
+      payload = await buildWindow({ since, until: untilParam || null, base: cached });
+    } catch (e) {
+      console.error("[personalizados refresh]", e);
+      refreshError = e?.message || String(e);
+      payload = cached; // degrada pro cache — nunca derruba a página (sem Application Error)
+    }
+  } else if (!payload) {
+    // Cold start (KV vazio/perdido): sem base. Tenta um build limitado à janela-teto; se
+    // ainda estourar, entrega vazio + aviso (dá pra reconstruir por períodos, que mesclam).
+    try {
+      payload = await buildWindow({ since: defaultSince(null), base: null });
+    } catch (e) {
+      console.error("[personalizados cold]", e);
+      refreshError = e?.message || String(e);
+      payload = { orders: [], truncated: false, fetchedAt: null, lastWindow: null };
     }
   } else {
-    // Primeiro acesso de todos (ou refresh manual): fetch síncrono.
-    payload = await refetchAndStore();
+    // Load normal com cache: revalida em background (janela incremental) se estiver velho.
+    const ageMs = Date.now() - (payload.fetchedAt || 0);
+    if (ageMs > ORDERS_REVALIDATE_AFTER * 1000 && waitUntil) {
+      const base = payload;
+      waitUntil(
+        buildWindow({ since: defaultSince(base.fetchedAt), base }).catch((e) =>
+          console.error("[personalizados revalidate]", e)
+        )
+      );
+    }
   }
 
   // Nº Sankhya durável (KV): a coluna SEMPRE lê daqui, então nunca some ao enviar.
   const nunotas = await loadNunotas(kv, session.shop);
   let sankhyaError = null;
   // No "Atualizar" manual, puxa o Nº Sankhya dos PENDENTES que ainda não têm, e persiste.
-  if (forceRefresh) {
+  if (forceRefresh && payload?.orders?.length) {
     try {
       const pendingIds = payload.orders
         .filter((o) => !sent[o.id] && nunotas[o.legacyId] == null)
@@ -224,15 +275,18 @@ export const loader = async ({ request, context }) => {
       sankhyaError = e?.message || String(e);
     }
   }
-  for (const o of payload.orders) o.nunota = nunotas[o.legacyId] ?? null;
+  const list = payload?.orders || [];
+  for (const o of list) o.nunota = nunotas[o.legacyId] ?? null;
 
   // Status do envio ao Sankhya (KV) — alimenta a coluna "Sankhya" + contadores + saúde.
   const sankhyaStatus = await loadSankhyaStatus(kv, session.shop);
 
   return json({
-    orders: payload.orders,
-    truncated: payload.truncated,
-    fetchedAt: payload.fetchedAt || null,
+    orders: list,
+    truncated: payload?.truncated || false,
+    fetchedAt: payload?.fetchedAt || null,
+    lastWindow: payload?.lastWindow || null,
+    refreshError,
     sankhyaError,
     sent,
     sankhyaStatus,
@@ -254,9 +308,11 @@ export const action = async ({ request, context }) => {
 
     // "Atualizar Banco": puxa o Nº Sankhya de TODOS os pedidos e grava no mapa durável.
     // NÃO altera o status (não mexe em "enviado"). Uso pontual para backfill do histórico.
+    // Lê os ids do payload em cache (KV) — NÃO re-pagina a Shopify (isso estourava o teto
+    // de subrequests do Worker); o cache já contém todo o histórico mesclado.
     if (intent === "refreshNunotas") {
-      const { sellers } = await loadSellers(admin);
-      const { orders } = await buildOrdersPayload(admin, buildPersoQuery(sellers));
+      const cached = await kv.get(`personalizados:orders:${session.shop}`, "json").catch(() => null);
+      const orders = cached?.orders || [];
       const nunotas = await loadNunotas(kv, session.shop);
       const ids = orders.map((o) => o.legacyId).filter(Boolean);
       let matched = 0;
@@ -476,7 +532,7 @@ function sankhyaBadge(st) {
 }
 
 export default function Personalizados() {
-  const { orders, sent, sankhyaStatus, sellers, hasToken, truncated, sankhyaError } = useLoaderData();
+  const { orders, sent, sankhyaStatus, sellers, hasToken, truncated, sankhyaError, refreshError, fetchedAt, lastWindow } = useLoaderData();
   const actionData = useActionData();
   const submit = useSubmit();
   const navigate = useNavigate();
@@ -495,6 +551,18 @@ export default function Personalizados() {
   const [search, setSearch] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+
+  // Modal "Atualizar período" — janela personalizada (created_at). `until` vazio = hoje.
+  const [periodOpen, setPeriodOpen] = useState(false);
+  const [periodSince, setPeriodSince] = useState("");
+  const [periodUntil, setPeriodUntil] = useState("");
+  const doRefreshPeriod = useCallback(() => {
+    if (!periodSince) return;
+    const qs = new URLSearchParams({ refresh: "1", since: periodSince });
+    if (periodUntil) qs.set("until", periodUntil);
+    setPeriodOpen(false);
+    navigate(`/app/personalizados?${qs.toString()}`);
+  }, [periodSince, periodUntil, navigate]);
 
   const filteredOrders = useMemo(() => {
     const q = normalizeStr(search.trim());
@@ -708,6 +776,11 @@ export default function Personalizados() {
           onAction: () => navigate("/app/personalizados?refresh=1"),
         },
         {
+          content: "Atualizar período…",
+          disabled: isRefreshing,
+          onAction: () => setPeriodOpen(true),
+        },
+        {
           content: "Cadastro de vendedores",
           onAction: () => navigate("/app/personalizados/cadastro-de-vendedores"),
         },
@@ -723,6 +796,15 @@ export default function Personalizados() {
         {!hasToken && (
           <Banner tone="critical" title="CLICKUP_TOKEN não configurado">
             <p>Rode <code>wrangler secret put CLICKUP_TOKEN</code> no worker antes de enviar.</p>
+          </Banner>
+        )}
+
+        {refreshError && (
+          <Banner tone="warning" title="Não foi possível atualizar os pedidos agora">
+            <p>
+              Exibindo os dados já salvos (podem estar defasados). Tente de novo, ou use
+              "Atualizar período…" com uma janela menor. Detalhe: {refreshError}
+            </p>
           </Banner>
         )}
 
@@ -796,9 +878,17 @@ export default function Personalizados() {
                       <Button pressed={filter === "pendentes"} onClick={() => setFilterAndReset("pendentes")}>Pendentes</Button>
                       <Button pressed={filter === "semAtributos"} onClick={() => setFilterAndReset("semAtributos")}>Sem atributos</Button>
                     </ButtonGroup>
-                    <Text as="span" variant="bodySm" tone="subdued">
-                      {filteredOrders.length} pedido(s) · Sankhya: {sankhyaCounts.sent} gravados · {sankhyaCounts.pending} pendentes · {sankhyaCounts.error} erros{sankhyaCounts.naoEnviado ? ` · ${sankhyaCounts.naoEnviado} não enviados` : ""}{sankhyaCounts.seller ? ` · ${sankhyaCounts.seller} vendedor(es)` : ""} · ClickUp: {pendingCount} pendente(s){selectedResources.length > 0 ? ` · ${selectedResources.length} selecionado(s)` : ""}
-                    </Text>
+                    <BlockStack gap="050">
+                      <Text as="span" variant="bodySm" tone="subdued">
+                        {filteredOrders.length} pedido(s) · Sankhya: {sankhyaCounts.sent} gravados · {sankhyaCounts.pending} pendentes · {sankhyaCounts.error} erros{sankhyaCounts.naoEnviado ? ` · ${sankhyaCounts.naoEnviado} não enviados` : ""}{sankhyaCounts.seller ? ` · ${sankhyaCounts.seller} vendedor(es)` : ""} · ClickUp: {pendingCount} pendente(s){selectedResources.length > 0 ? ` · ${selectedResources.length} selecionado(s)` : ""}
+                      </Text>
+                      {mounted && fetchedAt && (
+                        <Text as="span" variant="bodySm" tone="subdued">
+                          Última atualização: {new Date(fetchedAt).toLocaleString("pt-BR")}
+                          {lastWindow?.since ? ` · janela ${lastWindow.since} → ${lastWindow.until}` : ""}
+                        </Text>
+                      )}
+                    </BlockStack>
                   </InlineStack>
                   <InlineStack gap="200">
                     <Button
@@ -998,6 +1088,44 @@ export default function Personalizados() {
           </Modal.Section>
         </Modal>
       )}
+
+      <Modal
+        open={periodOpen}
+        onClose={() => setPeriodOpen(false)}
+        title="Atualizar por período"
+        primaryAction={{
+          content: "Atualizar",
+          disabled: !periodSince || isRefreshing,
+          onAction: doRefreshPeriod,
+        }}
+        secondaryActions={[{ content: "Cancelar", onAction: () => setPeriodOpen(false) }]}
+      >
+        <Modal.Section>
+          <BlockStack gap="300">
+            <Text as="p" variant="bodySm" tone="subdued">
+              Busca os pedidos personalizados criados no período (por data de criação) e
+              mescla no histórico já carregado — não substitui os antigos. Use quando ficou
+              alguns dias sem atualizar (ex.: início 4 dias atrás → hoje).
+            </Text>
+            <InlineStack gap="300">
+              <TextField
+                label="De"
+                type="date"
+                value={periodSince}
+                onChange={setPeriodSince}
+                autoComplete="off"
+              />
+              <TextField
+                label="Até (vazio = hoje)"
+                type="date"
+                value={periodUntil}
+                onChange={setPeriodUntil}
+                autoComplete="off"
+              />
+            </InlineStack>
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
     </Page>
   );
 }
