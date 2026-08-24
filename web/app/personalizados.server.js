@@ -282,7 +282,10 @@ async function fetchOrdersPage(admin, q, cursor) {
 }
 
 // Query de busca: PE1198 por SKU + tag "Nome Personalizado" + tags dos vendedores.
-export function buildPersoQuery(sellers) {
+// `since`/`until` (YYYY-MM-DD) delimitam a JANELA por created_at. A dashboard atualiza
+// por janela pequena (não re-pagina o histórico inteiro, que estourava o limite de
+// subrequests do Worker). Piso sempre em PERSO_SINCE.
+export function buildPersoQuery(sellers, { since = PERSO_SINCE, until = null } = {}) {
   const clauses = [`sku:${PERSO_SKU}`, `tag:'${ORDER_TAG}'`];
   const seen = new Set();
   for (const s of sellers || []) {
@@ -292,7 +295,23 @@ export function buildPersoQuery(sellers) {
       if (safe && !seen.has(key)) { seen.add(key); clauses.push(`tag:'${safe}'`); }
     }
   }
-  return `(${clauses.join(" OR ")}) AND created_at:>=${PERSO_SINCE}`;
+  const start = since && String(since) > PERSO_SINCE ? since : PERSO_SINCE;
+  let q = `(${clauses.join(" OR ")}) AND created_at:>=${start}`;
+  if (until) q += ` AND created_at:<=${until}`;
+  return q;
+}
+
+// Mescla pedidos recém-buscados (janela) na lista em cache, casando por legacyId: os
+// que vieram na janela SOBRESCREVEM os antigos (dados atualizados vencem) e os que não
+// vieram permanecem. Ordena por data de criação desc (dashboard espera novos no topo).
+// Assim a atualização custa só a janela recente, mas a lista mantém todo o histórico.
+export function mergePersoOrders(prevOrders, freshOrders) {
+  const byId = new Map();
+  for (const o of prevOrders || []) byId.set(o.legacyId || o.id, o);
+  for (const o of freshOrders || []) byId.set(o.legacyId || o.id, o);
+  return [...byId.values()].sort((a, b) =>
+    String(b.createdAt || "").localeCompare(String(a.createdAt || ""))
+  );
 }
 
 export async function buildOrdersPayload(admin, q) {
