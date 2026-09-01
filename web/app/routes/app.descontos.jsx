@@ -322,11 +322,12 @@ export const action = async ({ request, context }) => {
       return {};
     };
 
-    const buildShippingConfigValue = ({ enabled, collections, orderTags }) =>
+    const buildShippingConfigValue = ({ enabled, collections, minSubtotal, orderTags }) =>
       JSON.stringify({
         enabled,
         collectionIds: collections.map((c) => c.id),
         collections,
+        minSubtotal: minSubtotal > 0 ? minSubtotal : 0,
         orderTags: orderTags ?? [],
       });
 
@@ -529,15 +530,18 @@ export const action = async ({ request, context }) => {
       const startsAt = formData.get("startsAt") || null;
       const endsAt = formData.get("endsAt") || null;
       const orderTags = parseTags(formData.get("orderTags"));
+      // Valor mínimo do carrinho (independente de coleção). 0 = desligado.
+      const minSubtotal = Math.max(0, parseFloat(formData.get("minSubtotal")) || 0);
 
-      if (!collections.length) {
+      if (!collections.length && minSubtotal <= 0) {
         return json({
           success: false,
-          error: "Selecione pelo menos uma coleção para o frete grátis.",
+          error:
+            "Selecione pelo menos uma coleção ou informe um valor mínimo para o frete grátis.",
         });
       }
 
-      const configValue = buildShippingConfigValue({ enabled, collections, orderTags });
+      const configValue = buildShippingConfigValue({ enabled, collections, minSubtotal, orderTags });
       const result = await upsertShippingDiscount({ configValue, startsAt, endsAt });
       if (result.error) return json({ success: false, error: result.error });
       return json({ success: true, action: "save-shipping", warning: result.warning });
@@ -549,6 +553,7 @@ export const action = async ({ request, context }) => {
       const configValue = buildShippingConfigValue({
         enabled: newEnabled,
         collections: currentConfig.collections || [],
+        minSubtotal: Number(currentConfig.minSubtotal) || 0,
         orderTags: currentConfig.orderTags || [],
       });
       const result = await upsertShippingDiscount({ configValue });
@@ -675,6 +680,9 @@ export default function Descontos() {
     (config?.orderTags ?? []).join(", ")
   );
   const [shipColls, setShipColls] = useState(shippingConfig?.collections ?? []);
+  const [shipMinSubtotal, setShipMinSubtotal] = useState(
+    shippingConfig?.minSubtotal ? String(shippingConfig.minSubtotal) : ""
+  );
   const [shipEnabled, setShipEnabled] = useState(
     shippingConfig?.enabled ?? true
   );
@@ -767,17 +775,22 @@ export default function Descontos() {
     setShipColls((prev) => prev.filter((c) => c.id !== id));
   }, []);
 
+  const shipMinNum = Math.max(0, parseFloat(shipMinSubtotal) || 0);
+  const canSaveShipping =
+    (shipColls.length > 0 || shipMinNum > 0) && !isSubmitting;
+
   const handleSaveShipping = useCallback(() => {
-    if (!shipColls.length) return;
+    if (!shipColls.length && shipMinNum <= 0) return;
     const fd = new FormData();
     fd.set("intent", "save-shipping");
     fd.set("collections", JSON.stringify(shipColls));
+    fd.set("minSubtotal", String(shipMinNum));
     fd.set("enabled", shipEnabled ? "true" : "false");
     fd.set("orderTags", shipTagsInput);
     if (shipStart) fd.set("startsAt", new Date(shipStart).toISOString());
     if (shipEnd) fd.set("endsAt", new Date(shipEnd).toISOString());
     submit(fd, { method: "post" });
-  }, [shipColls, shipEnabled, shipStart, shipEnd, shipTagsInput, submit]);
+  }, [shipColls, shipMinNum, shipEnabled, shipStart, shipEnd, shipTagsInput, submit]);
 
   const handleToggleShipping = useCallback(() => {
     if (!shippingConfig) return;
@@ -1284,9 +1297,11 @@ export default function Descontos() {
           Campanha de Frete Grátis
         </Text>
         <Text as="p" tone="subdued">
-          Se o carrinho tiver qualquer item das coleções escolhidas, a opção de
-          entrega mais barata fica grátis. O período é controlado pelas datas
-          abaixo (a Shopify encerra automaticamente no fim).
+          A opção de entrega mais barata fica grátis quando o carrinho tem
+          qualquer item das coleções escolhidas OU quando o valor dos produtos
+          atinge o valor mínimo (independente de coleção). O período é
+          controlado pelas datas abaixo (a Shopify encerra automaticamente no
+          fim).
         </Text>
 
         {hasShipping && shippingConfig && (
@@ -1303,7 +1318,15 @@ export default function Descontos() {
                 {shippingConfig.enabled
                   ? `Frete grátis na opção mais barata para ${
                       (shippingConfig.collections || []).length
-                    } coleção(ões).`
+                    } coleção(ões)${
+                      shippingConfig.minSubtotal > 0
+                        ? ` ou acima de R$ ${Number(
+                            shippingConfig.minSubtotal
+                          ).toLocaleString("pt-BR", {
+                            minimumFractionDigits: 2,
+                          })}`
+                        : ""
+                    }.`
                   : "A campanha está salva mas não está zerando o frete."}
               </Text>
               <Button
@@ -1375,6 +1398,24 @@ export default function Descontos() {
                 <Divider />
 
                 <Text as="h3" variant="headingMd">
+                  Valor mínimo do carrinho (opcional)
+                </Text>
+                <TextField
+                  label="Frete grátis acima de"
+                  type="number"
+                  value={shipMinSubtotal}
+                  onChange={setShipMinSubtotal}
+                  prefix="R$"
+                  autoComplete="off"
+                  min={0}
+                  step={0.01}
+                  placeholder="ex.: 299"
+                  helpText="Vale para o carrinho inteiro, independente de coleção. Usa o valor dos produtos APÓS descontos — um cupom que derrube o carrinho abaixo do limite tira o frete grátis. Deixe em branco para não usar."
+                />
+
+                <Divider />
+
+                <Text as="h3" variant="headingMd">
                   Período da campanha
                 </Text>
                 <InlineStack gap="400">
@@ -1424,7 +1465,7 @@ export default function Descontos() {
                       isSubmitting &&
                       navigation.formData?.get("intent") === "save-shipping"
                     }
-                    disabled={shipColls.length === 0 || isSubmitting}
+                    disabled={!canSaveShipping}
                   >
                     Salvar campanha de frete
                   </Button>
@@ -1440,7 +1481,7 @@ export default function Descontos() {
                   Como funciona
                 </Text>
                 <Text as="p" variant="bodySm">
-                  1. Escolha as coleções participantes.
+                  1. Escolha as coleções participantes e/ou um valor mínimo.
                 </Text>
                 <Text as="p" variant="bodySm">
                   2. Defina o período (início e fim).
@@ -1451,7 +1492,8 @@ export default function Descontos() {
                 <Divider />
                 <Text as="p" variant="bodySm" tone="subdued">
                   O frete grátis é aplicado na opção de entrega de menor custo
-                  de cada grupo de entrega.
+                  de cada grupo de entrega, quando há item de coleção elegível
+                  OU o valor dos produtos atinge o mínimo.
                 </Text>
                 {hasShipping && (
                   <BlockStack gap="100">
