@@ -1,0 +1,32 @@
+{
+  "payload": {
+    "export": "cart-delivery-options-discounts-generate-run",
+    "target": "cart.delivery-options.discounts.generate.run",
+    "input": {
+      "cart": {
+        "deliveryGroups": [
+          {
+            "deliveryOptions": [
+              { "handle": "standard", "title": "Padrão", "cost": { "amount": "20.00" } }
+            ]
+          }
+        ],
+        "lines": [
+          {
+            "cost": { "totalAmount": { "amount": "150.00" } },
+            "merchandise": { "__typename": "ProductVariant", "product": { "inAnyCollection": false } }
+          }
+        ]
+      },
+      "discount": {
+        "discountClasses": ["SHIPPING"],
+        "metafield": {
+          "jsonValue": { "enabled": true, "collectionIds": [], "minSubtotal": 299 }
+        }
+      }
+    },
+    "output": {
+      "operations": []
+    }
+  }
+}

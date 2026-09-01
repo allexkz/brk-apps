@@ -11,13 +11,25 @@ import {
 const EMPTY = { operations: [] };
 
 /**
- * Frete grátis por coleção.
+ * Frete grátis por coleção OU por valor mínimo do carrinho.
  *
- * Regra: se o carrinho tiver QUALQUER item de alguma das coleções configuradas,
- * zera (100% OFF) a opção de entrega de MENOR custo de cada grupo de entrega.
+ * Regra: zera (100% OFF) a opção de entrega de MENOR custo de cada grupo de
+ * entrega quando QUALQUER uma das condições abaixo é satisfeita:
+ *   1. O carrinho tem algum item de alguma das coleções configuradas; OU
+ *   2. O subtotal dos PRODUTOS atinge o valor mínimo configurado (`minSubtotal`).
+ *
+ * As duas condições são independentes: a de valor vale para o carrinho inteiro,
+ * qualquer produto, mesmo sem coleção elegível.
+ *
+ * O valor usado é a soma do `cost.totalAmount` de cada linha — o valor dos
+ * produtos APÓS descontos. Assim um cupom que derrube o carrinho abaixo do
+ * limite tira o frete grátis (ex.: R$210 com um cupom de −R$20 vira R$190, e
+ * se o mínimo for R$199 o cliente NÃO ganha frete).
  *
  * Configuração (metafield "$app:descontos-personalizados/config", JSON):
- *   { "enabled": true, "collectionIds": ["gid://shopify/Collection/123"] }
+ *   { "enabled": true,
+ *     "collectionIds": ["gid://shopify/Collection/123"],
+ *     "minSubtotal": 299 }
  * `collectionIds` também alimenta a variável $collectionIds do input query
  * (via [extensions.input.variables] no shopify.extension.toml).
  *
@@ -42,13 +54,25 @@ export function cartDeliveryOptionsDiscountsGenerateRun(input) {
     return EMPTY;
   }
 
-  // Há algum item elegível (de alguma coleção configurada) no carrinho?
-  const hasEligible = cart.lines.some(
+  // Condição 1: há algum item de alguma coleção configurada no carrinho?
+  const hasEligibleCollection = cart.lines.some(
     (line) =>
       line.merchandise.__typename === 'ProductVariant' &&
       line.merchandise.product?.inAnyCollection === true,
   );
-  if (!hasEligible) {
+
+  // Condição 2: o valor dos produtos (APÓS descontos) atinge o mínimo?
+  const minSubtotal = Number(config.minSubtotal) || 0;
+  let meetsMinSubtotal = false;
+  if (minSubtotal > 0) {
+    const productTotal = cart.lines.reduce(
+      (sum, line) => sum + parseFloat(line.cost?.totalAmount?.amount ?? '0'),
+      0,
+    );
+    meetsMinSubtotal = productTotal >= minSubtotal;
+  }
+
+  if (!hasEligibleCollection && !meetsMinSubtotal) {
     return EMPTY;
   }
 
