@@ -6,12 +6,13 @@
 //   2. Gravar a personalização (Tipo/Nome/Local/Posição) no campo AD_NOMEPERSONALIZADO
 //      do ITEM (TGFITE) correspondente à peça personalizada, dentro daquele pedido.
 //
-// O token de acesso expira em 300s; cacheamos no KV com margem e, se um request voltar
-// 401/403 ou o gateway acusar token inválido/expirado (GTW3403), limpamos o cache e
-// reautenticamos 1x.
+// O token de acesso expira em 300s; cacheamos EM MEMÓRIA (module-scope) com margem e, se
+// um request voltar 401/403 ou o gateway acusar token inválido/expirado (GTW3403),
+// limpamos o cache e reautenticamos 1x. NÃO gravamos o token no KV: o free tier tem só
+// 1.000 writes/dia por conta (somando as 3 lojas) e o token de 270s era regravado a cada
+// ciclo do cron (TTL < intervalo de 15 min), estourando o limite diário de PUTs.
 
 const SANKHYA_BASE = "https://api.sankhya.com.br";
-const TOKEN_KV_KEY = "sankhya:token";
 const TOKEN_TTL = 270; // s — token expira em 300s
 const MATCH_FIELD = "AD_PEDECOMMERCE"; // coluna da TGFCAB com o id numérico da Shopify
 
@@ -76,25 +77,18 @@ async function authenticate(env) {
   throw lastErr;
 }
 
-// Token em cache no KV (SESSIONS), renovado quando expira (TTL) ou quando `force`.
+// Token em cache EM MEMÓRIA (module-scope), renovado quando expira (TTL) ou quando `force`.
+// `kv` é mantido na assinatura por compatibilidade (chamadas em withAuth/worker.js), mas
+// não é mais usado para o token. `force` fura o cache em memória (usado na recuperação de
+// 401 no withAuth). O reuso vale dentro do isolate/lote enquanto válido; não é
+// compartilhado entre isolates (custo aceito: mais auths em instância fria).
+let _memToken = null; // { token, exp } — exp em ms (Date.now)
+
 export async function getSankhyaToken(env, kv, force = false) {
   if (!hasSankhyaCreds(env)) throw new Error("Credenciais Sankhya não configuradas no worker.");
-  if (kv && !force) {
-    try {
-      const cached = await kv.get(TOKEN_KV_KEY);
-      if (cached) return cached;
-    } catch {
-      // ignora e reautentica
-    }
-  }
+  if (!force && _memToken && _memToken.exp > Date.now()) return _memToken.token;
   const token = await authenticate(env);
-  if (kv) {
-    try {
-      await kv.put(TOKEN_KV_KEY, token, { expirationTtl: TOKEN_TTL });
-    } catch {
-      // cache é best-effort
-    }
-  }
+  _memToken = { token, exp: Date.now() + TOKEN_TTL * 1000 };
   return token;
 }
 
@@ -148,7 +142,7 @@ async function withAuth(env, kv, fn) {
     return await fn(token);
   } catch (e) {
     if (isAuthError(e)) {
-      if (kv) { try { await kv.delete(TOKEN_KV_KEY); } catch { /* segue */ } }
+      _memToken = null; // invalida o cache em memória e reautentica 1x
       const fresh = await getSankhyaToken(env, kv, true);
       return await fn(fresh);
     }

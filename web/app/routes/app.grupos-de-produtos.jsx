@@ -601,6 +601,34 @@ export default function GruposDeProdutos() {
 
   const addGroupBlock = useCallback(() => setEditing((cur) => [...cur, blankGroup()]), []);
 
+  // ── Geração em massa (colar códigos, um por linha) ──
+  const [bulkCodes, setBulkCodes] = useState("");
+  const [bulkOptionName, setBulkOptionName] = useState("");
+
+  const generateBlocks = useCallback(() => {
+    const codes = bulkCodes
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (codes.length === 0) return;
+    const seen = new Set();
+    const blocks = [];
+    for (const code of codes) {
+      if (seen.has(code)) continue; // dedup dentro do lote
+      seen.add(code);
+      blocks.push({ ...blankGroup(), name: code, optionName: bulkOptionName.trim() });
+    }
+    setEditing((cur) => {
+      // se o editor só tem o bloco inicial vazio, substitui; senão, anexa
+      const pristine = (cur || []).filter(
+        (g) => !g.id && !g.name.trim() && !g.optionName.trim() && g.products.length === 0
+      );
+      const keep = (cur || []).filter((g) => !pristine.includes(g));
+      return [...keep, ...blocks];
+    });
+    setBulkCodes(""); // limpa a caixa; mantém o nome padrão p/ reuso
+  }, [bulkCodes, bulkOptionName]);
+
   const removeGroupBlock = useCallback((key) => {
     setEditing((cur) => {
       const next = cur.filter((g) => g._key !== key);
@@ -673,10 +701,13 @@ export default function GruposDeProdutos() {
 
   // ── Busca ──
   const [query, setQuery] = useState("");
+  // Mais recentes primeiro: novas entradas são sempre push()adas ao fim do
+  // index (edições substituem no lugar), então basta reverter a ordem base.
+  const orderedGroups = useMemo(() => [...groups].reverse(), [groups]);
   const filteredGroups = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return groups;
-    return groups.filter((g) =>
+    if (!q) return orderedGroups;
+    return orderedGroups.filter((g) =>
       (g.name || "").toLowerCase().includes(q) ||
       (g.optionName || "").toLowerCase().includes(q) ||
       (g.id || "").toLowerCase().includes(q) ||
@@ -684,7 +715,7 @@ export default function GruposDeProdutos() {
         (p) => (p.title || "").toLowerCase().includes(q) || (p.handle || "").toLowerCase().includes(q)
       )
     );
-  }, [groups, query]);
+  }, [orderedGroups, query]);
 
   // ── Paginação + seleção múltipla (IndexTable) ──
   const [pageSize, setPageSize] = useState("25");
@@ -749,6 +780,33 @@ export default function GruposDeProdutos() {
               <p>{invalidCount} grupo(s) incompleto(s) serão <strong>ignorados</strong> ao salvar. Só {validCount} grupo(s) válido(s) serão gravados.</p>
             </Banner>
           )}
+
+          <Card>
+            <BlockStack gap="400">
+              <Text as="h2" variant="headingMd">Gerar grupos em massa</Text>
+              <TextField
+                label="Códigos dos grupos (um por linha)"
+                value={bulkCodes}
+                onChange={setBulkCodes}
+                multiline={4}
+                autoComplete="off"
+                placeholder={"C02888\nC02889\nC02890"}
+              />
+              <TextField
+                label="Nome da opção padrão (visível na loja)"
+                value={bulkOptionName}
+                onChange={setBulkOptionName}
+                autoComplete="off"
+                placeholder="Ex: Modelo:"
+              />
+              <InlineStack align="space-between" blockAlign="center">
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Cada linha vira um grupo com o código no <strong>nome interno</strong> e o nome da opção padrão preenchido. Você ainda edita cada bloco e adiciona os produtos antes de salvar.
+                </Text>
+                <Button onClick={generateBlocks} disabled={!bulkCodes.trim()}>Gerar blocos</Button>
+              </InlineStack>
+            </BlockStack>
+          </Card>
 
           {editing.map((grp, gi) => {
             const isCustom = grp.swatchSource === "custom";
