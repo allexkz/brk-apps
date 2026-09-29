@@ -8,18 +8,24 @@
           {
             "id": "gid://shopify/CartLine/0",
             "quantity": 1,
+
+            "cost": { "amountPerQuantity": { "amount": "100.0" } },
             "bundle": null, "item": null, "trigger": null,
             "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/111" } }
           },
           {
             "id": "gid://shopify/CartLine/1",
             "quantity": 1,
+
+            "cost": { "amountPerQuantity": { "amount": "100.0" } },
             "bundle": { "value": "b1" }, "item": { "value": "999" }, "trigger": { "value": "111" },
             "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/999" } }
           },
           {
             "id": "gid://shopify/CartLine/2",
             "quantity": 1,
+
+            "cost": { "amountPerQuantity": { "amount": "100.0" } },
             "bundle": { "value": "b1" }, "item": { "value": "998" }, "trigger": { "value": "111" },
             "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/998" } }
           }

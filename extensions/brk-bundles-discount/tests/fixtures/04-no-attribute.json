@@ -8,6 +8,8 @@
           {
             "id": "gid://shopify/CartLine/0",
             "quantity": 1,
+
+            "cost": { "amountPerQuantity": { "amount": "100.0" } },
             "bundle": null, "item": null, "trigger": null,
             "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/111" } }
           }
