@@ -7,16 +7,19 @@
 //
 // Estado em KV (mapa por legacyId da Shopify):  personalizados:sankhya:<shop>
 //   { name, status, retry, reason, nunota, written, personalizations, at }
-//   status: "pending" | "sent" | "error" | "seller"
+//   status: "pending" | "sent" | "error" | "seller" | "hold" | "done"
 //   - "sent"    terminal, nunca reescrito pelo automático (idempotente)
 //   - "pending" aguardando NUNOTA ou erro transitório → cron reprocessa (retry=true)
 //   - "error"   permanente (produto não casa) → só reprocesso manual (retry=false)
 //   - "seller"  pedido de vendedor → não enviado por ora (retry=false)
+//   - "hold"    "em análise" (manual) → fora do alerta/cron (retry=false)
+//   - "done"    concluído/encerrado manualmente → fora do alerta/cron (retry=false).
+//               NÃO significa "gravado no Sankhya" — é só "resolvido, não me cobre mais".
 //
 // IMPORTANTE: manter este módulo livre de React/Polaris — o worker.js o importa direto.
 
 import { findSellerForTags } from "./vendedores";
-import { fetchNunotasByShopifyIds, sendPersonalizationsToSankhya, getSankhyaToken } from "./sankhya.server";
+import { fetchNunotasByShopifyIds, sendPersonalizationsToSankhya } from "./sankhya.server";
 
 export const ORDER_TAG = "Nome Personalizado";
 export const PERSO_SKU = "PE1198";
@@ -353,7 +356,11 @@ export async function loadNunotas(kv, shop) {
   try { return (await kv.get(nunotasKey(shop), "json")) || {}; } catch { return {}; }
 }
 export async function saveNunotas(kv, shop, map) {
-  if (kv) await kv.put(nunotasKey(shop), JSON.stringify(map));
+  if (!kv) return;
+  // PUT é o recurso escasso do KV (1.000/dia por conta); só grava se o conteúdo mudou.
+  const serialized = JSON.stringify(map);
+  const current = await kv.get(nunotasKey(shop));
+  if (current !== serialized) await kv.put(nunotasKey(shop), serialized);
 }
 
 // Status do envio ao Sankhya — mapa { legacyId: {status, retry, ...} }.
@@ -364,7 +371,11 @@ export async function loadSankhyaStatus(kv, shop) {
 }
 
 export async function saveSankhyaStatus(kv, shop, map) {
-  if (kv) await kv.put(sankhyaStatusKey(shop), JSON.stringify(map));
+  if (!kv) return;
+  // PUT é o recurso escasso do KV (1.000/dia por conta); só grava se o conteúdo mudou.
+  const serialized = JSON.stringify(map);
+  const current = await kv.get(sankhyaStatusKey(shop));
+  if (current !== serialized) await kv.put(sankhyaStatusKey(shop), serialized);
 }
 
 // Escrita por MERGE: relê o mapa mais recente e aplica só as chaves alteradas. Reduz
@@ -385,6 +396,15 @@ async function updateSankhyaStatus(kv, shop, updates) {
 function isPermanentError(msg) {
   return /n[ãa]o encontrados/i.test(String(msg || ""));
 }
+
+// Razão padrão de um job aguardando a NUNOTA sincronizar no Sankhya. Constante (não muda
+// entre ciclos) para o mapa de status ficar byte-idêntico quando nada progride — assim
+// saveSankhyaStatus pula o PUT e o cron não gasta write à toa.
+const PENDING_NUNOTA_REASON = "Aguardando sincronização no Sankhya (sem Nº Sankhya).";
+
+// Razão de um pedido concluído/encerrado manualmente. Vira status "done" (retry:false).
+// NÃO significa gravado no Sankhya — é só "resolvido, fora da fila". Reversível via reprocesso.
+const DONE_REASON = "Concluído manualmente (marcado como resolvido).";
 
 // Processa jobs (grava no Sankhya) e atualiza o status em KV.
 //   legacyIds = lista específica; null = todos com retry===true (uso do cron).
@@ -419,7 +439,17 @@ export async function processPersoJobs(env, kv, shop, legacyIds = null) {
     const job = status[id] || {};
     const nunota = nunotas[id] ?? null;
     if (nunota == null) {
-      status[id] = { ...job, status: "pending", retry: true, reason: "Aguardando sincronização no Sankhya (sem Nº Sankhya).", at: nowISO() };
+      // Preserva o `at` se o job já estava neste MESMO estado pendente — mantém o mapa
+      // byte-idêntico entre ciclos do cron (senão gera 1 PUT/ciclo à toa no KV).
+      const unchanged =
+        job.status === "pending" && job.retry === true && job.reason === PENDING_NUNOTA_REASON;
+      status[id] = {
+        ...job,
+        status: "pending",
+        retry: true,
+        reason: PENDING_NUNOTA_REASON,
+        at: unchanged ? job.at : nowISO(),
+      };
       continue;
     }
     toSend.push({ legacyId: id, name: job.name, nunota, personalizations: job.personalizations || [] });
@@ -436,13 +466,23 @@ export async function processPersoJobs(env, kv, shop, legacyIds = null) {
         sent++;
       } else {
         const permanent = isPermanentError(r.error);
+        const nextStatus = permanent ? "error" : "pending";
+        const nextReason = r.error || "erro";
+        const nextNunota = r.nunota ?? job.nunota ?? null;
+        // Preserva o `at` se o estado (status/retry/reason/nunota) não mudou — evita PUT à
+        // toa quando o mesmo erro transitório se repete ciclo após ciclo.
+        const unchanged =
+          job.status === nextStatus &&
+          job.retry === !permanent &&
+          job.reason === nextReason &&
+          (job.nunota ?? null) === nextNunota;
         status[r.legacyId] = {
           ...job,
-          status: permanent ? "error" : "pending",
+          status: nextStatus,
           retry: !permanent,
-          reason: r.error || "erro",
-          nunota: r.nunota ?? job.nunota ?? null,
-          at: nowISO(),
+          reason: nextReason,
+          nunota: nextNunota,
+          at: unchanged ? job.at : nowISO(),
         };
         errors.push(`${job.name || r.legacyId}: ${r.error}`);
       }
@@ -481,7 +521,7 @@ export async function ingestPersoOrder(env, kv, shop, perso) {
     return;
   }
 
-  await updateSankhyaStatus(kv, shop, { [id]: { name: perso.name, status: "pending", retry: true, reason: null, seller: perso.seller || null, personalizations: perso.personalizations.map(slimPerso), at: nowISO() } });
+  await updateSankhyaStatus(kv, shop, { [id]: { name: perso.name, status: "pending", retry: true, reason: PENDING_NUNOTA_REASON, seller: perso.seller || null, personalizations: perso.personalizations.map(slimPerso), at: nowISO() } });
 
   try {
     await processPersoJobs(env, kv, shop, [id]);
@@ -503,10 +543,8 @@ export async function drainSankhyaQueue(env, kv, shop) {
   const hasPending = Object.values(status).some((j) => j?.retry === true);
   if (!hasPending) return { processed: 0, sent: 0, pending: 0, errors: [] };
 
-  // Há pedido para subir: agora sim força token novo. O force evita reusar um token em
-  // cache já expirado (TTL 270s < intervalo 15 min) ou escrito por request concorrente
-  // da dashboard — resolvia um erro de auth que tínhamos antes.
-  try { await getSankhyaToken(env, kv, true); } catch { /* withAuth reautenta na 1ª chamada real */ }
+  // Há pedido para subir: o token é resolvido sob demanda (cache em memória em
+  // sankhya.server.js; withAuth reautentica se expirar). Não gravamos mais token no KV.
   return processPersoJobs(env, kv, shop, null);
 }
 
@@ -541,4 +579,20 @@ export async function reprocessOrders(env, kv, shop, orderDatas, sellers) {
   await updateSankhyaStatus(kv, shop, updates);
   const res = await processPersoJobs(env, kv, shop, targets);
   return { ...res, sellers: sellerCount, noAttr };
+}
+
+// Marca pedidos como CONCLUÍDOS/encerrados manualmente: status "done" (retry:false), tirando-os
+// do alerta de pendências e do reenvio automático. NÃO marca como "sent"/gravado no Sankhya nem
+// toca no ClickUp — é só "resolvido, não me cobre mais". Reversível via reprocessOrders. { done }.
+export async function completeOrders(kv, shop, legacyIds = []) {
+  const status = await loadSankhyaStatus(kv, shop);
+  const updates = {};
+  let done = 0;
+  for (const id of legacyIds) {
+    const job = status[id] || {};
+    updates[id] = { ...job, status: "done", retry: false, manual: true, reason: DONE_REASON, at: nowISO() };
+    done++;
+  }
+  if (done) await updateSankhyaStatus(kv, shop, updates);
+  return { done };
 }

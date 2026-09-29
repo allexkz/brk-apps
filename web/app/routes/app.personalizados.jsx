@@ -45,6 +45,7 @@ import {
   saveNunotas,
   loadSankhyaStatus,
   reprocessOrders,
+  completeOrders,
 } from "../personalizados.server";
 
 // Constantes de EXIBIÇÃO (usadas no componente/client). Não podem vir do módulo
@@ -353,6 +354,17 @@ export const action = async ({ request, context }) => {
       return json({ success: true, action: "sendSankhya", ...summary });
     }
 
+    // "Concluir": marca os selecionados como RESOLVIDOS/encerrados (status Sankhya "done"),
+    // tirando-os do alerta de pendências e do reenvio automático. NÃO marca ClickUp/Sankhya como
+    // enviado/gravado — só encerra a fila do "tem algo a fazer". Reversível pelo "Enviar Sankhya".
+    if (intent === "markDone") {
+      const ids = JSON.parse(formData.get("ids") || "[]");
+      if (ids.length === 0) return json({ success: false, error: "Nenhum pedido selecionado." });
+      const legacyIds = ids.map((g) => numericId(g)).filter(Boolean);
+      const { done } = await completeOrders(kv, session.shop, legacyIds);
+      return json({ success: true, action: "markDone", done });
+    }
+
     const token = context.env.CLICKUP_TOKEN;
     if (!token) return json({ success: false, error: "CLICKUP_TOKEN não configurado no worker." });
 
@@ -521,14 +533,27 @@ function sankhyaBadge(st) {
     badge = <Badge>Não enviado</Badge>;
   } else if (st.status === "sent") {
     badge = <Badge tone="success">{st.written ? `Gravado (${st.written})` : "Gravado"}</Badge>;
+  } else if (st.status === "done") {
+    badge = <Badge>Concluído</Badge>;
   } else if (st.status === "seller") {
     badge = <Badge tone="info">Vendedor (n/e)</Badge>;
+  } else if (st.status === "hold") {
+    badge = <Badge>Em análise</Badge>;
   } else if (st.status === "error") {
     badge = <Badge tone="critical">Erro</Badge>;
   } else {
     badge = <Badge tone="attention">Pendente</Badge>;
   }
   return st?.reason ? <span title={st.reason}>{badge}</span> : badge;
+}
+
+// Idade (min) a partir da qual um pendente do Sankhya é considerado "preso" (envio automático
+// possivelmente travado). ~3 ciclos do cron de 15 min.
+const STUCK_MIN = 45;
+// "Preso" = status Sankhya "pending" há mais de STUCK_MIN. `nowTs` injetado (SSR/testável).
+function isStuckPending(st, nowTs) {
+  if (!(st?.status === "pending" && st.at)) return false;
+  return Math.floor((nowTs - new Date(st.at).getTime()) / 60000) >= STUCK_MIN;
 }
 
 export default function Personalizados() {
@@ -568,11 +593,13 @@ export default function Personalizados() {
     const q = normalizeStr(search.trim());
     const fromTs = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : null;
     const toTs = dateTo ? new Date(`${dateTo}T23:59:59.999`).getTime() : null;
+    const nowTs = Date.now();
     return orders.filter((o) => {
       // status (segmented)
       if (filter === "enviados" && !sent[o.id]) return false;
       if (filter === "pendentes" && sent[o.id]) return false;
       if (filter === "semAtributos" && o.hasAttributes) return false;
+      if (filter === "presos" && !isStuckPending(sankhyaStatus[o.legacyId], nowTs)) return false;
       // intervalo de datas (por data de criação do pedido)
       if (fromTs || toTs) {
         const ts = new Date(o.createdAt).getTime();
@@ -599,7 +626,7 @@ export default function Personalizados() {
       }
       return true;
     });
-  }, [orders, sent, sellers, filter, search, dateFrom, dateTo]);
+  }, [orders, sent, sellers, filter, search, dateFrom, dateTo, sankhyaStatus]);
 
   const size = Number(pageSize);
   const totalPages = Math.max(1, Math.ceil(filteredOrders.length / size));
@@ -635,6 +662,15 @@ export default function Personalizados() {
     clearSelection();
   }, [selectedResources, submit, clearSelection]);
 
+  const doMarkDone = useCallback(() => {
+    if (selectedResources.length === 0) return;
+    const fd = new FormData();
+    fd.set("intent", "markDone");
+    fd.set("ids", JSON.stringify(selectedResources));
+    submit(fd, { method: "post" });
+    clearSelection();
+  }, [selectedResources, submit, clearSelection]);
+
   const pendingCount = useMemo(
     () => orders.filter((o) => !sent[o.id]).length,
     [orders, sent]
@@ -648,12 +684,14 @@ export default function Personalizados() {
 
   // Contadores do envio ao Sankhya (sobre os pedidos exibidos).
   const sankhyaCounts = useMemo(() => {
-    const c = { sent: 0, pending: 0, error: 0, seller: 0, naoEnviado: 0 };
+    const c = { sent: 0, pending: 0, error: 0, seller: 0, hold: 0, done: 0, naoEnviado: 0 };
     for (const o of orders) {
       const st = sankhyaStatus[o.legacyId]?.status;
       if (st === "sent") c.sent++;
       else if (st === "error") c.error++;
       else if (st === "seller") c.seller++;
+      else if (st === "hold") c.hold++;
+      else if (st === "done") c.done++;
       else if (st === "pending") c.pending++;
       else c.naoEnviado++; // sem entrada no mapa → nunca ingerido (precisa de backfill)
     }
@@ -667,16 +705,16 @@ export default function Personalizados() {
   // evita hydration mismatch); recalcula a cada "Atualizar".
   const [mounted, setMounted] = useState(false);
   useEffect(() => { setMounted(true); }, []);
-  const STUCK_MIN = 45; // ~3 ciclos do cron
   const stuck = useMemo(() => {
     const now = Date.now();
     let count = 0;
     let oldestMin = 0;
     for (const o of orders) {
       const st = sankhyaStatus[o.legacyId];
-      if (st?.status === "pending" && st.at) {
+      if (isStuckPending(st, now)) {
         const ageMin = Math.floor((now - new Date(st.at).getTime()) / 60000);
-        if (ageMin >= STUCK_MIN) { count++; if (ageMin > oldestMin) oldestMin = ageMin; }
+        count++;
+        if (ageMin > oldestMin) oldestMin = ageMin;
       }
     }
     return { count, oldestMin };
@@ -815,12 +853,16 @@ export default function Personalizados() {
         )}
 
         {showStuck && (
-          <Banner tone="warning" title={`${stuck.count} pedido(s) aguardando envio ao Sankhya há mais de ${STUCK_MIN} min`}>
+          <Banner
+            tone="warning"
+            title={`${stuck.count} pedido(s) aguardando envio ao Sankhya há mais de ${STUCK_MIN} min`}
+            action={{ content: "Ver pedidos", onAction: () => { setSearch(""); setDateFrom(""); setDateTo(""); setFilterAndReset("presos"); } }}
+          >
             <p>
-              O mais antigo está há ~{stuck.oldestMin} min pendente. Pode ser atraso do
-              Sankhya em receber o pedido, ou o envio automático (cron) travado. Se
-              persistir, verifique os Cron Triggers do worker no Cloudflare — ou envie
-              manualmente com o botão "Enviar Sankhya".
+              O mais antigo está há ~{stuck.oldestMin} min pendente. Pode ser atraso do Sankhya em
+              receber o pedido, ou o envio automático (cron) travado. Clique em "Ver pedidos" para
+              filtrar exatamente esses e resolvê-los com "Enviar Sankhya" (reprocessar) ou
+              "Concluir" (encerrar sem reenviar).
             </p>
           </Banner>
         )}
@@ -856,6 +898,9 @@ export default function Personalizados() {
             )}
           </Banner>
         )}
+        {actionData?.success && actionData.action === "markDone" && (
+          <Banner tone="success" title={`${actionData.done} pedido(s) concluído(s) — removidos do alerta de pendências.`} />
+        )}
         {actionData?.error && (
           <Banner tone="critical" title="Erro"><p>{actionData.error}</p></Banner>
         )}
@@ -880,7 +925,7 @@ export default function Personalizados() {
                     </ButtonGroup>
                     <BlockStack gap="050">
                       <Text as="span" variant="bodySm" tone="subdued">
-                        {filteredOrders.length} pedido(s) · Sankhya: {sankhyaCounts.sent} gravados · {sankhyaCounts.pending} pendentes · {sankhyaCounts.error} erros{sankhyaCounts.naoEnviado ? ` · ${sankhyaCounts.naoEnviado} não enviados` : ""}{sankhyaCounts.seller ? ` · ${sankhyaCounts.seller} vendedor(es)` : ""} · ClickUp: {pendingCount} pendente(s){selectedResources.length > 0 ? ` · ${selectedResources.length} selecionado(s)` : ""}
+                        {filteredOrders.length} pedido(s) · Sankhya: {sankhyaCounts.sent} gravados · {sankhyaCounts.pending} pendentes · {sankhyaCounts.error} erros{sankhyaCounts.naoEnviado ? ` · ${sankhyaCounts.naoEnviado} não enviados` : ""}{sankhyaCounts.seller ? ` · ${sankhyaCounts.seller} vendedor(es)` : ""}{sankhyaCounts.hold ? ` · ${sankhyaCounts.hold} em análise` : ""}{sankhyaCounts.done ? ` · ${sankhyaCounts.done} concluído(s)` : ""} · ClickUp: {pendingCount} pendente(s){selectedResources.length > 0 ? ` · ${selectedResources.length} selecionado(s)` : ""}
                       </Text>
                       {mounted && fetchedAt && (
                         <Text as="span" variant="bodySm" tone="subdued">
@@ -905,6 +950,14 @@ export default function Personalizados() {
                       onClick={doSendSankhya}
                     >
                       Enviar Sankhya
+                    </Button>
+                    <Button
+                      tone="success"
+                      disabled={selectedResources.length === 0}
+                      loading={isSubmitting && navigation.formData?.get("intent") === "markDone"}
+                      onClick={doMarkDone}
+                    >
+                      Concluir
                     </Button>
                     <Button
                       tone="critical"
