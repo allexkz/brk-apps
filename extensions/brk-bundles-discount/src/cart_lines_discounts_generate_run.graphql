@@ -9,6 +9,11 @@ query Input {
     lines {
       id
       quantity
+      cost {
+        amountPerQuantity {
+          amount
+        }
+      }
       bundle: attribute(key: "_brk_bundle") {
         value
       }

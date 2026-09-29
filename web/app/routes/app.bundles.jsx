@@ -324,6 +324,7 @@ async function syncDiscount(admin, bundles) {
         value: Number(a.value) || 0,
         label: labelForItem(a),
         maxQty: Number.isFinite(Number(a.maxQty)) ? Number(a.maxQty) : 1,
+        applyTo: b.exemption ? "trigger" : "addon",
       };
     }
     map[b.id] = { enabled: true, items };
@@ -570,6 +571,15 @@ export const action = async ({ request, context }) => {
       return json({ success: true, action: "toggle", warning: r.warning });
     }
 
+    if (intent === "toggleExemption") {
+      const id = formData.get("id");
+      const b = bundles.find((x) => x.id === id);
+      if (b) b.exemption = !b.exemption;
+      const r = await persist(admin, shopId, bundles);
+      if (r.error) return json({ success: false, error: r.error });
+      return json({ success: true, action: "toggleExemption", warning: r.warning });
+    }
+
     if (intent === "duplicate") {
       const id = formData.get("id");
       const b = bundles.find((x) => x.id === id);
@@ -663,7 +673,7 @@ function exportBundlesCSV(list, stats, filename) {
     const s = String(v ?? "");
     return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  const header = ["id", "nome", "ativo", "exibicao", "prioridade", "exclusivo", "itens", "descontos", "segmentacao", "criado_em", "pedidos", "quantidade", "receita_reais"];
+  const header = ["id", "nome", "ativo", "exibicao", "prioridade", "exclusivo", "isencao", "itens", "descontos", "segmentacao", "criado_em", "pedidos", "quantidade", "receita_reais"];
   const lines = [header.join(",")];
   for (const b of list) {
     const s = stats[b.id] || {};
@@ -678,6 +688,7 @@ function exportBundlesCSV(list, stats, filename) {
         b.display,
         b.priority ?? 0,
         b.exclusive ? "sim" : "nao",
+        b.exemption ? "sim" : "nao",
         (b.addons || []).length,
         descontos,
         b.targets?.type,
@@ -720,6 +731,7 @@ function blankBundle() {
     display: "inline",
     priority: 0,
     exclusive: false,
+    exemption: false, // isenção fiscal: desconto do add-on vai p/ o produto vinculado
     chooseMax: 0, // 0 = sem limite de quantos add-ons o cliente pode marcar
     title: "Leve também",
     subtitle: "",
@@ -1070,6 +1082,12 @@ export default function Bundles() {
                   <Text as="p" tone="subdued" variant="bodySm">
                     Cada add-on tem seu próprio desconto. Produtos com +1 variante viram pills na página p/ o cliente escolher.
                   </Text>
+                  <Checkbox
+                    label="Isenção fiscal — aplicar o desconto no produto vinculado"
+                    checked={!!b.exemption}
+                    onChange={(v) => setField("exemption", v)}
+                    helpText="O add-on sai a preço cheio e o valor do desconto dele é abatido do produto que disparou o bundle. O total do cliente não muda."
+                  />
                   {b.addons.length === 0 && <Text as="p" tone="subdued">Nenhum add-on. Clique em "Selecionar produtos".</Text>}
                   <BlockStack gap="300">
                     {b.addons.map((a) => {
@@ -1329,6 +1347,7 @@ export default function Bundles() {
                           <Text as="span" variant="bodyMd" fontWeight="bold">{b.name || b.id}</Text>
                           <InlineStack gap="150" blockAlign="center">
                             <Badge tone={b.enabled ? "success" : undefined}>{b.enabled ? "Ativo" : "Desativado"}</Badge>
+                            {b.exemption && <Badge tone="info">Isenção</Badge>}
                             <Text as="span" tone="subdued" variant="bodySm">Prioridade {b.priority ?? 0}{b.exclusive ? " · exclusivo" : ""}</Text>
                           </InlineStack>
                         </BlockStack>
@@ -1354,6 +1373,7 @@ export default function Bundles() {
                           <Button size="micro" onClick={() => runIntent("duplicate", { id: b.id })}>Duplicar</Button>
                           <Button size="micro" onClick={() => startEdit(b)}>Editar</Button>
                           <Button size="micro" onClick={() => runIntent("toggle", { id: b.id })}>{b.enabled ? "Desativar" : "Ativar"}</Button>
+                          <Button size="micro" onClick={() => runIntent("toggleExemption", { id: b.id })}>{b.exemption ? "Desativar isenção" : "Ativar isenção"}</Button>
                           <Button size="micro" tone="critical" onClick={() => runIntent("delete", { id: b.id })}>Excluir</Button>
                         </InlineStack>
                       </div>
