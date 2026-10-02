@@ -1,4 +1,4 @@
-query Input {
+query Input($collectionIds: [ID!]! = [], $tags: [String!]! = []) {
   discount {
     discountClasses
     metafield(namespace: "brk-bundles", key: "config") {
@@ -28,6 +28,14 @@ query Input {
         ... on ProductVariant {
           product {
             id
+            inCollections(ids: $collectionIds) {
+              collectionId
+              isMember
+            }
+            hasTags(tags: $tags) {
+              tag
+              hasTag
+            }
           }
         }
       }

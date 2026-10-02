@@ -8,40 +8,117 @@
           {
             "id": "gid://shopify/CartLine/0",
             "quantity": 1,
-
-            "cost": { "amountPerQuantity": { "amount": "100.0" } },
-            "bundle": null, "item": null, "trigger": null,
-            "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/111" } }
+            "cost": {
+              "amountPerQuantity": {
+                "amount": "100.0"
+              }
+            },
+            "bundle": null,
+            "item": null,
+            "trigger": null,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "product": {
+                "id": "gid://shopify/Product/111",
+                "inCollections": [],
+                "hasTags": []
+              }
+            }
           },
           {
             "id": "gid://shopify/CartLine/1",
             "quantity": 1,
-
-            "cost": { "amountPerQuantity": { "amount": "100.0" } },
-            "bundle": null, "item": null, "trigger": null,
-            "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/222" } }
+            "cost": {
+              "amountPerQuantity": {
+                "amount": "100.0"
+              }
+            },
+            "bundle": null,
+            "item": null,
+            "trigger": null,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "product": {
+                "id": "gid://shopify/Product/222",
+                "inCollections": [],
+                "hasTags": []
+              }
+            }
           },
           {
             "id": "gid://shopify/CartLine/2",
             "quantity": 1,
-
-            "cost": { "amountPerQuantity": { "amount": "100.0" } },
-            "bundle": { "value": "b1" }, "item": { "value": "999" }, "trigger": { "value": "111" },
-            "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/999" } }
+            "cost": {
+              "amountPerQuantity": {
+                "amount": "100.0"
+              }
+            },
+            "bundle": {
+              "value": "b1"
+            },
+            "item": {
+              "value": "999"
+            },
+            "trigger": {
+              "value": "111"
+            },
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "product": {
+                "id": "gid://shopify/Product/999",
+                "inCollections": [],
+                "hasTags": []
+              }
+            }
           },
           {
             "id": "gid://shopify/CartLine/3",
             "quantity": 1,
-
-            "cost": { "amountPerQuantity": { "amount": "100.0" } },
-            "bundle": { "value": "b1" }, "item": { "value": "999" }, "trigger": { "value": "222" },
-            "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/999" } }
+            "cost": {
+              "amountPerQuantity": {
+                "amount": "100.0"
+              }
+            },
+            "bundle": {
+              "value": "b1"
+            },
+            "item": {
+              "value": "999"
+            },
+            "trigger": {
+              "value": "222"
+            },
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "product": {
+                "id": "gid://shopify/Product/999",
+                "inCollections": [],
+                "hasTags": []
+              }
+            }
           }
         ]
       },
       "discount": {
-        "discountClasses": ["PRODUCT"],
-        "metafield": { "jsonValue": { "bundles": { "b1": { "enabled": true, "items": { "999": { "mode": "gift", "label": "Brinde", "maxQty": 1 } } } } } }
+        "discountClasses": [
+          "PRODUCT"
+        ],
+        "metafield": {
+          "jsonValue": {
+            "bundles": {
+              "b1": {
+                "enabled": true,
+                "items": {
+                  "999": {
+                    "mode": "gift",
+                    "label": "Brinde",
+                    "maxQty": 1
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "output": {
@@ -52,8 +129,19 @@
             "candidates": [
               {
                 "message": "Brinde",
-                "targets": [{ "cartLine": { "id": "gid://shopify/CartLine/2", "quantity": 1 } }],
-                "value": { "percentage": { "value": 100 } }
+                "targets": [
+                  {
+                    "cartLine": {
+                      "id": "gid://shopify/CartLine/2",
+                      "quantity": 1
+                    }
+                  }
+                ],
+                "value": {
+                  "percentage": {
+                    "value": 100
+                  }
+                }
               }
             ]
           }

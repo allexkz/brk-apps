@@ -1,9 +1,9 @@
 {%- comment -%}
   BRK Bundles — bloco de add-on na página de produto.
 
-  Lê todos os bundles do shop metafield `brk_bundles.config` (JSON, PUBLIC_READ),
-  filtra os ativos que casam com o produto atual (por produtos / collections /
-  tags / metafield) e:
+  Lê os bundles ativos do shop metafield `brk_bundles.live` (JSON, derivado do
+  config pela rota admin), casa ao vivo os que valem para o produto atual (por
+  produtos / collections / tags / metafield) e:
     - emite um <script type="application/json" class="brk-bundle-data"> por bundle
       casado (consumido por assets/bundle.js — vale para inline E popup);
     - renderiza a UI inline quando bundle.display == 'inline'.
@@ -24,22 +24,36 @@
 {%- endcomment -%}
 
 {%- comment -%}
-  Índice por produto: `applies` já traz só os bundles que casam com este produto
-  (produtos/collections/tags — gravado pela rota admin). `dynamic` traz os bundles
-  por metafield (poucos), casados ao vivo aqui. Não varremos mais o config inteiro.
+  `live` (shop) traz só os bundles ATIVOS, e a segmentação é casada AO VIVO aqui:
+  produto (product.id), collections (product.collections) e tags (product.tags),
+  além de metafield. Nada é gravado por produto, então mudar uma collection ou tag
+  vale na hora. Ids em `live` são strings.
+
+  Fallback (antes de `live` existir): índice legado por produto `applies` (já
+  casado) + `dynamic` (bundles por metafield).
 {%- endcomment -%}
-{%- assign applied = product.metafields.brk_bundles.applies.value -%}
-{%- assign dyn = shop.metafields.brk_bundles.dynamic.value -%}
-{%- if applied and dyn -%}
-  {%- assign candidates = applied | concat: dyn -%}
-{%- elsif applied -%}
-  {%- assign candidates = applied -%}
-{%- elsif dyn -%}
-  {%- assign candidates = dyn -%}
+{%- assign live = shop.metafields.brk_bundles.live.value -%}
+{%- if live -%}
+  {%- assign candidates = live -%}
+  {%- assign live_mode = true -%}
+{%- else -%}
+  {%- assign live_mode = false -%}
+  {%- assign applied = product.metafields.brk_bundles.applies.value -%}
+  {%- assign dyn = shop.metafields.brk_bundles.dynamic.value -%}
+  {%- if applied and dyn -%}
+    {%- assign candidates = applied | concat: dyn -%}
+  {%- elsif applied -%}
+    {%- assign candidates = applied -%}
+  {%- elsif dyn -%}
+    {%- assign candidates = dyn -%}
+  {%- endif -%}
 {%- endif -%}
 
 {%- if candidates and candidates.size > 0 -%}
-  {{ 'bundle.css' | asset_url | stylesheet_tag }}
+  {%- comment -%} chaves delimitadas p/ busca exata por substring {%- endcomment -%}
+  {%- assign bd_pid = product.id | append: '' -%}
+  {%- capture bd_colls -%},{%- for c in product.collections -%}{{ c.id }},{%- endfor -%}{%- endcapture -%}
+  {%- capture bd_tags -%}|{{ product.tags | join: '|' | downcase }}|{%- endcapture -%}
 
   {%- capture brk_bundle_vars -%}
     --brk-bd-border: {{ block.settings.border_color | default: '#E1E3E5' }};
@@ -52,14 +66,17 @@
   {%- endcapture -%}
 
   {%- assign sorted = candidates | sort: 'priority' | reverse -%}
-  <brk-bundles class="brk-bd-wrap" data-product-id="{{ product.id }}" style="{{ brk_bundle_vars | strip_newlines }}">
+  {%- capture bd_html -%}
     {%- assign excl_active = false -%}
     {%- assign excl_priority = 0 -%}
     {%- for bundle in sorted -%}
       {%- if bundle.enabled == false -%}{%- continue -%}{%- endif -%}
       {%- if bundle.addons == blank or bundle.addons.size == 0 -%}{%- continue -%}{%- endif -%}
 
-      {%- comment -%} applies já vem casado; só metafield precisa casar ao vivo {%- endcomment -%}
+      {%- comment -%}
+        metafield casa sempre ao vivo; no modo `live` produtos/collections/tags
+        também (no fallback, `applies` já vem casado).
+      {%- endcomment -%}
       {%- assign is_match = true -%}
       {%- if bundle.targets.type == 'metafield' -%}
         {%- assign is_match = false -%}
@@ -67,6 +84,24 @@
         {%- if mf != blank -%}
           {%- assign wanted = bundle.targets.metafield.value -%}
           {%- if wanted == blank or mf == wanted or mf.value == wanted -%}{%- assign is_match = true -%}{%- endif -%}
+        {%- endif -%}
+      {%- elsif live_mode -%}
+        {%- assign is_match = false -%}
+        {%- if bundle.targets.type == 'products' -%}
+          {%- for tid in bundle.targets.productIds -%}
+            {%- assign tid_s = tid | append: '' -%}
+            {%- if tid_s == bd_pid -%}{%- assign is_match = true -%}{%- break -%}{%- endif -%}
+          {%- endfor -%}
+        {%- elsif bundle.targets.type == 'collections' -%}
+          {%- for cid in bundle.targets.collectionIds -%}
+            {%- assign needle = ',' | append: cid | append: ',' -%}
+            {%- if bd_colls contains needle -%}{%- assign is_match = true -%}{%- break -%}{%- endif -%}
+          {%- endfor -%}
+        {%- elsif bundle.targets.type == 'tags' -%}
+          {%- for tg in bundle.targets.tags -%}
+            {%- assign needle = tg | downcase | prepend: '|' | append: '|' -%}
+            {%- if bd_tags contains needle -%}{%- assign is_match = true -%}{%- break -%}{%- endif -%}
+          {%- endfor -%}
         {%- endif -%}
       {%- endif -%}
       {%- unless is_match -%}{%- continue -%}{%- endunless -%}
@@ -149,7 +184,15 @@
 
       {%- if bundle.exclusive -%}{%- assign excl_active = true -%}{%- assign excl_priority = bundle.priority -%}{%- endif -%}
     {%- endfor -%}
-  </brk-bundles>
+  {%- endcapture -%}
+
+  {%- comment -%} só renderiza (CSS + wrapper) se algum bundle casou {%- endcomment -%}
+  {%- if bd_html != blank -%}
+    {{ 'bundle.css' | asset_url | stylesheet_tag }}
+    <brk-bundles class="brk-bd-wrap" data-product-id="{{ product.id }}" style="{{ brk_bundle_vars | strip_newlines }}">
+      {{- bd_html -}}
+    </brk-bundles>
+  {%- endif -%}
 {%- endif -%}
 
 {% schema %}

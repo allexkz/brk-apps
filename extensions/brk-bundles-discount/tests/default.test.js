@@ -1,7 +1,21 @@
 import path from "path";
 import fs from "fs";
+import { execFileSync } from "child_process";
 import { describe, beforeAll, test, expect } from "vitest";
-import { buildFunction, getFunctionInfo, loadSchema, loadInputQuery, loadFixture, validateTestAssets, runFunction } from "@shopify/shopify-function-test-helpers";
+import { loadSchema, loadInputQuery, loadFixture, validateTestAssets, runFunction } from "@shopify/shopify-function-test-helpers";
+
+// On Windows the global Shopify CLI binary is `shopify.cmd`, which Node's
+// spawn (used by buildFunction/getFunctionInfo) does NOT resolve without a
+// shell. We invoke the CLI directly here with `shell: true` so PATHEXT applies
+// cross-platform.
+function shopifyCli(args, appRootDir) {
+  return execFileSync("shopify", args, {
+    cwd: appRootDir,
+    encoding: "utf8",
+    shell: true,
+    env: { ...process.env, SHOPIFY_INVOKED_BY: "shopify-function-test-helpers" },
+  });
+}
 
 describe("BRK Bundles Discount — Integration Test", () => {
   let schema;
@@ -14,11 +28,15 @@ describe("BRK Bundles Discount — Integration Test", () => {
 
   beforeAll(async () => {
     functionDir = path.dirname(__dirname);
-    await buildFunction(functionDir);
-    functionInfo = await getFunctionInfo(functionDir);
+    const appRootDir = path.dirname(functionDir);
+    const functionName = path.basename(functionDir);
+
+    shopifyCli(["app", "function", "build", "--path", functionName], appRootDir);
+    const infoJson = shopifyCli(["app", "function", "info", "--json", "--path", functionName], appRootDir);
+    functionInfo = JSON.parse(infoJson.trim());
     ({ schemaPath, functionRunnerPath, wasmPath, targeting } = functionInfo);
     schema = await loadSchema(schemaPath);
-  }, 45000);
+  }, 120000);
 
   const fixturesDir = path.join(__dirname, "fixtures");
   const fixtureFiles = fs
