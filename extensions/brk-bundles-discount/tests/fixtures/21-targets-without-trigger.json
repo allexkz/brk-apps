@@ -10,7 +10,7 @@
             "quantity": 1,
             "cost": {
               "amountPerQuantity": {
-                "amount": "30.0"
+                "amount": "300.0"
               }
             },
             "bundle": null,
@@ -20,7 +20,12 @@
               "__typename": "ProductVariant",
               "product": {
                 "id": "gid://shopify/Product/111",
-                "inCollections": [],
+                "inCollections": [
+                  {
+                    "collectionId": "gid://shopify/Collection/77",
+                    "isMember": true
+                  }
+                ],
                 "hasTags": []
               }
             }
@@ -30,7 +35,7 @@
             "quantity": 1,
             "cost": {
               "amountPerQuantity": {
-                "amount": "49.9"
+                "amount": "39.9"
               }
             },
             "bundle": {
@@ -39,14 +44,17 @@
             "item": {
               "value": "999"
             },
-            "trigger": {
-              "value": "111"
-            },
+            "trigger": null,
             "merchandise": {
               "__typename": "ProductVariant",
               "product": {
                 "id": "gid://shopify/Product/999",
-                "inCollections": [],
+                "inCollections": [
+                  {
+                    "collectionId": "gid://shopify/Collection/77",
+                    "isMember": false
+                  }
+                ],
                 "hasTags": []
               }
             }
@@ -67,41 +75,27 @@
                     "mode": "gift",
                     "label": "BRINDE",
                     "maxQty": 1,
-                    "applyTo": "trigger"
+                    "applyTo": "addon"
                   }
+                },
+                "targets": {
+                  "type": "collections",
+                  "collectionIds": [
+                    "77"
+                  ]
                 }
               }
-            }
+            },
+            "collectionIds": [
+              "gid://shopify/Collection/77"
+            ],
+            "tags": []
           }
         }
       }
     },
     "output": {
-      "operations": [
-        {
-          "productDiscountsAdd": {
-            "selectionStrategy": "ALL",
-            "candidates": [
-              {
-                "message": "BRINDE",
-                "targets": [
-                  {
-                    "cartLine": {
-                      "id": "gid://shopify/CartLine/0"
-                    }
-                  }
-                ],
-                "value": {
-                  "fixedAmount": {
-                    "amount": "30.00",
-                    "appliesToEachItem": false
-                  }
-                }
-              }
-            ]
-          }
-        }
-      ]
+      "operations": []
     }
   }
 }

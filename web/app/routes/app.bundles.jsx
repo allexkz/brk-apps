@@ -7,7 +7,7 @@ import {
   useFetcher,
   useSearchParams,
 } from "@remix-run/react";
-import { useState, useCallback, useMemo, useRef } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import {
   Page,
   Layout,
@@ -36,11 +36,15 @@ import { statsByBundle, salesReport } from "../bundles-db.server";
 
 const NS = "brk_bundles"; // shop metafield (fonte da verdade: admin/webhook/discount)
 const KEY = "config";
-const KEY_APPLIES = "applies"; // por produto (índice lido pelo tema)
-const KEY_DYNAMIC = "dynamic"; // shop: só bundles por metafield (match ao vivo no tema)
-const KEY_INDEXED = "indexed"; // shop: lista de product gids indexados (limpeza)
-const RESOLVE_CAP = 2000; // teto de produtos resolvidos por bundle (collection/tag)
+const KEY_LIVE = "live"; // shop: bundles ativos, casados ao vivo no tema (derivado do config)
+// Legado (índice por produto, substituído por `live`): só lidos pelo fallback do
+// bloco e apagados pela limpeza.
+const KEY_APPLIES = "applies";
+const KEY_DYNAMIC = "dynamic";
+const KEY_INDEXED = "indexed";
 const DISCOUNT_NS = "brk-bundles"; // metafield da discount (lido pela function)
+const DISCOUNT_MAX_BYTES = 9500; // function não recebe metafield > 10.000 bytes
+const FN_LIST_MAX = 100; // variables de lista do input query: máx. 100 itens
 const DISCOUNT_KEY = "config";
 const FN_TITLE = "BRK Bundles Desconto";
 const FN_HANDLE = "brk-bundles-discount";
@@ -86,8 +90,7 @@ function labelForItem(item) {
 async function ensureDefinition(admin) {
   const defs = [
     { name: "BRK Bundles (config)", key: KEY, ownerType: "SHOP" },
-    { name: "BRK Bundles (por produto)", key: KEY_APPLIES, ownerType: "PRODUCT" },
-    { name: "BRK Bundles (dinâmicos)", key: KEY_DYNAMIC, ownerType: "SHOP" },
+    { name: "BRK Bundles (ao vivo)", key: KEY_LIVE, ownerType: "SHOP" },
   ];
   for (const d of defs) {
     await admin
@@ -115,7 +118,7 @@ async function ensureDefinition(admin) {
   }
 }
 
-// ── Índice por produto (evita despejar todos os bundles em cada página) ───────
+// ── Dados ao vivo (lidos pelo tema) ─────────────────────────────────────────
 
 function chunk(arr, size) {
   const out = [];
@@ -123,132 +126,96 @@ function chunk(arr, size) {
   return out;
 }
 
-async function runConcurrent(tasks, limit) {
-  let i = 0;
-  const workers = Array.from({ length: Math.min(limit, tasks.length) }, async () => {
-    while (i < tasks.length) await tasks[i++]();
-  });
-  await Promise.all(workers);
+// Bundles ativos no formato lido pelo bloco do tema, que casa a segmentação ao
+// vivo (product.id / product.collections / product.tags) — nada é gravado por
+// produto. Ids viram string (o `contains` do Liquid compara strings) e os *Meta
+// (só usados pelo editor) ficam de fora. `priority` vira número (o `sort` do
+// Liquid põe nil no topo após o `reverse`). Derivado do config: pode ser recriado.
+function buildLive(bundles) {
+  return bundles
+    .filter((b) => b.enabled)
+    .map((b) => {
+      const t = b.targets || {};
+      return {
+        ...b,
+        priority: Number(b.priority) || 0,
+        targets: {
+          type: t.type,
+          productIds: (t.productIds || []).map(String),
+          collectionIds: (t.collectionIds || []).map(String),
+          tags: (t.tags || []).map(String),
+          metafield: t.metafield || { namespace: "", key: "", value: "" },
+        },
+      };
+    });
 }
 
-async function setMetafieldsChunked(admin, metafields) {
-  const tasks = chunk(metafields, 25).map((group) => () =>
-    admin.graphql(
-      `mutation set($metafields: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $metafields) { userErrors { field message } } }`,
-      { variables: { metafields: group } }
-    )
-  );
-  await runConcurrent(tasks, 3);
-}
-
-async function deleteAppliesChunked(admin, productGids) {
-  const ids = productGids.filter(Boolean);
-  if (!ids.length) return;
-  const identifiers = ids.map((gid) => ({ ownerId: gid, namespace: NS, key: KEY_APPLIES }));
-  const tasks = chunk(identifiers, 25).map((group) => () =>
-    admin.graphql(
-      `mutation del($metafields: [MetafieldIdentifierInput!]!) { metafieldsDelete(metafields: $metafields) { userErrors { field message } } }`,
-      { variables: { metafields: group } }
-    )
-  );
-  await runConcurrent(tasks, 3);
-}
-
-// Resolve os product GIDs que um bundle atinge (paginado, até RESOLVE_CAP).
-async function resolveBundleProductGids(admin, b) {
-  const t = b.targets || {};
-  const gids = new Set();
-  if (t.type === "products") {
-    for (const id of t.productIds || []) gids.add(`gid://shopify/Product/${id}`);
-    return gids;
-  }
-  const paginate = async (queryFn) => {
-    let cursor = null;
-    while (gids.size < RESOLVE_CAP) {
-      const conn = await queryFn(cursor);
-      if (!conn) break;
-      for (const n of conn.nodes) gids.add(n.id);
-      if (!conn.pageInfo.hasNextPage) break;
-      cursor = conn.pageInfo.endCursor;
-    }
-  };
-  if (t.type === "collections") {
-    for (const cid of t.collectionIds || []) {
-      await paginate(async (cursor) => {
-        const res = await admin.graphql(
-          `query($id: ID!, $after: String) { collection(id: $id) { products(first: 250, after: $after) { nodes { id } pageInfo { hasNextPage endCursor } } } }`,
-          { variables: { id: `gid://shopify/Collection/${cid}`, after: cursor } }
-        );
-        return (await res.json()).data.collection?.products || null;
-      });
-    }
-  } else if (t.type === "tags") {
-    for (const tag of t.tags || []) {
-      await paginate(async (cursor) => {
-        const res = await admin.graphql(
-          `query($q: String!, $after: String) { products(first: 250, after: $after, query: $q) { nodes { id } pageInfo { hasNextPage endCursor } } }`,
-          { variables: { q: `tag:'${String(tag).replace(/'/g, "")}'`, after: cursor } }
-        );
-        return (await res.json()).data.products || null;
-      });
-    }
-  }
-  return gids;
-}
-
-// Reconstrói o índice por produto a partir da config (fonte da verdade).
-async function rebuildIndex(admin, shopId, bundles) {
-  const active = bundles.filter((b) => b.enabled);
-  const dynamic = active.filter((b) => b.targets?.type === "metafield");
-  const indexable = active.filter((b) => ["products", "collections", "tags"].includes(b.targets?.type));
-
-  // gid -> lista de bundles que se aplicam
-  const byProduct = new Map();
-  for (const b of indexable) {
-    const gids = await resolveBundleProductGids(admin, b);
-    for (const gid of gids) {
-      if (!byProduct.has(gid)) byProduct.set(gid, []);
-      byProduct.get(gid).push(b);
-    }
-  }
-
-  // grava applies por produto
-  const writes = [];
-  for (const [gid, list] of byProduct) {
-    writes.push({ ownerId: gid, namespace: NS, key: KEY_APPLIES, type: "json", value: JSON.stringify(list) });
-  }
-
-  // metafield dinâmico (só bundles por metafield) + índice + limpeza de stale
-  const prevIndexed = await loadIndexed(admin);
-  const nextIndexed = [...byProduct.keys()];
-  const stale = prevIndexed.filter((gid) => !byProduct.has(gid));
-
-  const shopMetas = [
-    { ownerId: shopId, namespace: NS, key: KEY_DYNAMIC, type: "json", value: JSON.stringify(dynamic) },
-    { ownerId: shopId, namespace: NS, key: KEY_INDEXED, type: "json", value: JSON.stringify(nextIndexed) },
-  ];
-
-  await setMetafieldsChunked(admin, writes);
-  await deleteAppliesChunked(admin, stale);
-  await setMetafieldsChunked(admin, shopMetas);
-}
-
-async function loadIndexed(admin) {
+async function setShopMetafields(admin, metafields) {
   const res = await admin.graphql(
-    `query { shop { metafield(namespace: "${NS}", key: "${KEY_INDEXED}") { value } } }`
+    `mutation set($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) { userErrors { field message } }
+    }`,
+    { variables: { metafields } }
   );
-  const raw = (await res.json()).data.shop.metafield?.value;
-  try {
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
+  const data = await res.json();
+  return data.data.metafieldsSet.userErrors;
+}
+
+function liveMetafield(shopId, bundles) {
+  return { ownerId: shopId, namespace: NS, key: KEY_LIVE, type: "json", value: JSON.stringify(buildLive(bundles)) };
+}
+
+// ── Limpeza do índice legado (brk_bundles.applies por produto) ──────────────
+// Uma página de 250 produtos por chamada (≤ 11 subrequests); o cliente chama em
+// loop com o cursor. Só apaga metafields derivados — nunca o config.
+
+async function deleteMetafields(admin, identifiers) {
+  const errors = [];
+  for (const group of chunk(identifiers, 25)) {
+    const res = await admin.graphql(
+      `mutation del($metafields: [MetafieldIdentifierInput!]!) {
+        metafieldsDelete(metafields: $metafields) { deletedMetafields { key ownerId } userErrors { field message } }
+      }`,
+      { variables: { metafields: group } }
+    );
+    const data = await res.json();
+    errors.push(...(data.data?.metafieldsDelete?.userErrors || []).map((e) => e.message));
   }
+  return errors;
+}
+
+async function cleanupLegacyPage(admin, cursor, dryRun) {
+  const res = await admin.graphql(
+    `query($after: String) {
+      products(first: 250, after: $after) {
+        nodes { id applies: metafield(namespace: "${NS}", key: "${KEY_APPLIES}") { id } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }`,
+    { variables: { after: cursor || null } }
+  );
+  const conn = (await res.json()).data.products;
+  const owners = conn.nodes.filter((n) => n.applies).map((n) => n.id);
+  const errors = dryRun || !owners.length
+    ? []
+    : await deleteMetafields(admin, owners.map((ownerId) => ({ ownerId, namespace: NS, key: KEY_APPLIES })));
+  return {
+    scanned: conn.nodes.length,
+    found: owners.length,
+    errors,
+    hasNextPage: conn.pageInfo.hasNextPage,
+    endCursor: conn.pageInfo.endCursor,
+  };
 }
 
 async function loadConfig(admin) {
   const res = await admin.graphql(
     `query {
-      shop { id metafield(namespace: "${NS}", key: "${KEY}") { value } }
+      shop {
+        id
+        metafield(namespace: "${NS}", key: "${KEY}") { value }
+        live: metafield(namespace: "${NS}", key: "${KEY_LIVE}") { id }
+      }
     }`
   );
   const data = await res.json();
@@ -260,30 +227,15 @@ async function loadConfig(admin) {
   } catch {
     bundles = [];
   }
-  return { shopId, bundles };
+  return { shopId, bundles, hasLive: Boolean(data.data.shop.live) };
 }
 
+// Config (fonte da verdade) + `live` (derivado) na mesma mutation.
 async function saveConfig(admin, shopId, bundles) {
-  const res = await admin.graphql(
-    `mutation set($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) { userErrors { field message } }
-    }`,
-    {
-      variables: {
-        metafields: [
-          {
-            ownerId: shopId,
-            namespace: NS,
-            key: KEY,
-            type: "json",
-            value: JSON.stringify(bundles),
-          },
-        ],
-      },
-    }
-  );
-  const data = await res.json();
-  return data.data.metafieldsSet.userErrors;
+  return setShopMetafields(admin, [
+    { ownerId: shopId, namespace: NS, key: KEY, type: "json", value: JSON.stringify(bundles) },
+    liveMetafield(shopId, bundles),
+  ]);
 }
 
 async function findBundlesFunction(admin) {
@@ -312,24 +264,87 @@ async function findBundlesDiscount(admin) {
   )?.node;
 }
 
+// Metafield da discount, no formato compacto v2 (chaves curtas + tabela de
+// labels — a function não recebe metafield > 10.000 bytes; ver o formato em
+// extensions/brk-bundles-discount/src/cart_lines_discounts_generate_run.js):
+// items por bundle + `t` (a function valida o gatilho) + variables do input
+// query (`collectionIds`/`tags`, chaves de topo). Listas ≤ 100 e metafield <
+// 10.000 bytes: estourou, aquela validação sai (volta à regra antiga) e avisa,
+// em vez de quebrar o desconto.
+const V2_MODE = { gift: "g", percent: "p", fixed: "f" };
+
+function buildDiscountConfig(bundles) {
+  const active = bundles.filter((b) => b.enabled);
+  const collGids = new Set();
+  const tagSet = new Set();
+  for (const b of active) {
+    const t = b.targets || {};
+    if (t.type === "collections") for (const id of t.collectionIds || []) collGids.add(`gid://shopify/Collection/${id}`);
+    if (t.type === "tags") for (const tag of t.tags || []) tagSet.add(String(tag));
+  }
+  const checkColl = collGids.size <= FN_LIST_MAX;
+  const checkTags = tagSet.size <= FN_LIST_MAX;
+  const warnings = [];
+  if (!checkColl) warnings.push(`Mais de ${FN_LIST_MAX} collections nos bundles ativos: o checkout não vai validar a collection do produto-gatilho.`);
+  if (!checkTags) warnings.push(`Mais de ${FN_LIST_MAX} tags nos bundles ativos: o checkout não vai validar a tag do produto-gatilho.`);
+
+  const labels = [];
+  const labelIdx = (l) => {
+    let i = labels.indexOf(l);
+    if (i < 0) i = labels.push(l) - 1;
+    return i;
+  };
+  const map = {};
+  for (const b of active) {
+    const i = {};
+    for (const a of b.addons || []) {
+      const it = {
+        m: V2_MODE[a.mode] || V2_MODE.gift,
+        v: Number(a.value) || 0,
+        l: labelIdx(labelForItem(a)),
+        q: Number.isFinite(Number(a.maxQty)) ? Number(a.maxQty) : 1,
+      };
+      if (b.exemption) it.a = 1;
+      i[String(a.productId)] = it;
+    }
+    const entry = { i };
+    const t = b.targets || {};
+    if (t.type === "products") {
+      entry.t = { k: "p", ids: (t.productIds || []).map(Number) };
+    } else if (t.type === "collections" && checkColl) {
+      entry.t = { k: "c", ids: (t.collectionIds || []).map(Number) };
+    } else if (t.type === "tags" && checkTags) {
+      entry.t = { k: "g", ids: (t.tags || []).map(String) };
+    }
+    map[b.id] = entry;
+  }
+
+  const full = {
+    v: 2,
+    L: labels,
+    collectionIds: checkColl ? [...collGids] : [],
+    tags: checkTags ? [...tagSet] : [],
+    b: map,
+  };
+  const bytes = (v) => new TextEncoder().encode(JSON.stringify(v)).length;
+  if (bytes(full) <= DISCOUNT_MAX_BYTES) return { value: JSON.stringify(full), warnings };
+
+  // Grande demais: tira a validação de segmentação (só items).
+  const slim = { v: 2, L: labels, collectionIds: [], tags: [], b: {} };
+  for (const [id, e] of Object.entries(map)) slim.b[id] = { i: e.i };
+  if (bytes(slim) <= DISCOUNT_MAX_BYTES) {
+    warnings.push("Config de desconto grande demais para validar a segmentação no checkout (limite de 10 KB da Shopify Function). Os descontos seguem funcionando sem essa validação.");
+    return { value: JSON.stringify(slim), warnings };
+  }
+  return { error: "A config de desconto passou de 10 KB (limite da Shopify Function) — a function não conseguiria ler os descontos. Reduza bundles/add-ons ativos." };
+}
+
 // Espelha a config no metafield da discount e cria/atualiza a automatic discount.
 async function syncDiscount(admin, bundles) {
-  const map = {};
-  for (const b of bundles) {
-    if (!b.enabled) continue;
-    const items = {};
-    for (const a of b.addons || []) {
-      items[String(a.productId)] = {
-        mode: a.mode || "gift",
-        value: Number(a.value) || 0,
-        label: labelForItem(a),
-        maxQty: Number.isFinite(Number(a.maxQty)) ? Number(a.maxQty) : 1,
-        applyTo: b.exemption ? "trigger" : "addon",
-      };
-    }
-    map[b.id] = { enabled: true, items };
-  }
-  const discountMetafieldValue = JSON.stringify({ bundles: map });
+  const built = buildDiscountConfig(bundles);
+  if (built.error) return { error: built.error };
+  const discountMetafieldValue = built.value;
+  const configWarning = built.warnings.length ? built.warnings.join(" ") : null;
 
   const fn = await findBundlesFunction(admin);
   if (!fn) {
@@ -387,7 +402,7 @@ async function syncDiscount(admin, bundles) {
     const errs = data.data.discountAutomaticAppCreate.userErrors;
     if (errs.length) return { error: `Erro ao criar desconto: ${errs.map((e) => e.message).join(", ")}` };
   }
-  return {};
+  return { warning: configWarning };
 }
 
 // Resolve o conjunto de produtos (gid -> título) que um bundle realmente atinge.
@@ -438,20 +453,24 @@ function rangeToIso(start, end) {
   };
 }
 
-// Grava config (fonte da verdade) + espelha discount + reindexa produtos.
+// Grava config (fonte da verdade) + `live` + espelha a discount. Poucas
+// chamadas fixas, independente do tamanho das collections (sem índice por produto).
 async function persist(admin, shopId, bundles) {
   const errs = await saveConfig(admin, shopId, bundles);
   if (errs.length) return { error: errs.map((e) => e.message).join(", ") };
   const sync = await syncDiscount(admin, bundles);
   if (sync.error) return { error: sync.error };
-  let warning = sync.warning || null;
-  try {
-    await rebuildIndex(admin, shopId, bundles);
-  } catch (e) {
-    console.error("[rebuildIndex]", e?.message);
-    warning = (warning ? warning + " " : "") + "Aviso: falha ao reindexar produtos (a config foi salva; tente salvar de novo).";
-  }
-  return { warning };
+  return { warning: sync.warning || null };
+}
+
+// Recria só os dados derivados (`live` + discount) a partir do config atual,
+// sem tocar no config.
+async function regenerateDerived(admin, shopId, bundles) {
+  const errs = await setShopMetafields(admin, [liveMetafield(shopId, bundles)]);
+  if (errs.length) return { error: errs.map((e) => e.message).join(", ") };
+  const sync = await syncDiscount(admin, bundles);
+  if (sync.error) return { error: sync.error };
+  return { warning: sync.warning || null };
 }
 
 // ── Loader ──────────────────────────────────────────────────────────────────
@@ -461,7 +480,13 @@ export const loader = async ({ request, context }) => {
   const { admin, session } = await shopify.authenticate.admin(request);
 
   await ensureDefinition(admin);
-  const { bundles } = await loadConfig(admin);
+  const { shopId, bundles, hasLive } = await loadConfig(admin);
+  // Primeira abertura após a migração: gera `live` + discount a partir do config.
+  let liveWarning = null;
+  if (!hasLive) {
+    const r = await regenerateDerived(admin, shopId, bundles);
+    liveWarning = r.error || r.warning || null;
+  }
 
   const url = new URL(request.url);
   const start = url.searchParams.get("start") || "";
@@ -479,8 +504,15 @@ export const loader = async ({ request, context }) => {
     end,
     hasFn: Boolean(fn),
     hasDiscount: Boolean(discount),
+    liveWarning,
   });
 };
+
+// O loop da limpeza não precisa recarregar o loader a cada página.
+export function shouldRevalidate({ formData, defaultShouldRevalidate }) {
+  if (formData?.get("intent") === "cleanupLegacy") return false;
+  return defaultShouldRevalidate;
+}
 
 // ── Action ────────────────────────────────────────────────────────────────
 
@@ -543,7 +575,30 @@ export const action = async ({ request, context }) => {
       return json({ action: "fetchTargetProducts", products });
     }
 
+    // Limpeza do índice legado: 1 página por chamada (o cliente faz o loop).
+    // dryRun = só conta. Só apaga brk_bundles.applies (e, na última página,
+    // os shop metafields legados `indexed`/`dynamic`) — nunca o config.
+    if (intent === "cleanupLegacy") {
+      const dryRun = formData.get("dryRun") === "1";
+      const page = await cleanupLegacyPage(admin, formData.get("cursor") || null, dryRun);
+      if (!dryRun && !page.hasNextPage) {
+        const shopRes = await admin.graphql(`query { shop { id } }`);
+        const shopGid = (await shopRes.json()).data.shop.id;
+        page.errors.push(...(await deleteMetafields(admin, [
+          { ownerId: shopGid, namespace: NS, key: KEY_INDEXED },
+          { ownerId: shopGid, namespace: NS, key: KEY_DYNAMIC },
+        ])));
+      }
+      return json({ action: "cleanupLegacy", dryRun, ...page });
+    }
+
     const { shopId, bundles } = await loadConfig(admin);
+
+    if (intent === "regenerate") {
+      const r = await regenerateDerived(admin, shopId, bundles);
+      if (r.error) return json({ success: false, error: r.error });
+      return json({ success: true, action: "regenerate", warning: r.warning });
+    }
 
     if (intent === "save") {
       const bundle = JSON.parse(formData.get("bundle"));
@@ -802,7 +857,7 @@ function detectConflicts(bundles) {
 }
 
 export default function Bundles() {
-  const { bundles, stats, start, end, hasFn, hasDiscount } = useLoaderData();
+  const { bundles, stats, start, end, hasFn, hasDiscount, liveWarning } = useLoaderData();
   const actionData = useActionData();
   const submit = useSubmit();
   const navigation = useNavigation();
@@ -811,7 +866,36 @@ export default function Bundles() {
   const targetFetcher = useFetcher();
   const saveFetcher = useFetcher();
   const conflictFetcher = useFetcher();
+  const cleanupFetcher = useFetcher();
   const [searchParams, setSearchParams] = useSearchParams();
+
+  // ── Limpeza do índice legado (loop página a página pelo cliente) ──
+  // Sempre começa em simulação (só conta); apagar exige um 2º clique.
+  const [cleanup, setCleanup] = useState(null); // { dryRun, scanned, found, errors, running }
+  const runCleanup = useCallback((dryRun) => {
+    setCleanup({ dryRun, scanned: 0, found: 0, errors: [], running: true });
+    cleanupFetcher.submit({ intent: "cleanupLegacy", dryRun: dryRun ? "1" : "0", cursor: "" }, { method: "post" });
+  }, [cleanupFetcher]);
+  const lastCleanup = useRef(null);
+  useEffect(() => {
+    const d = cleanupFetcher.data;
+    if (!d || d === lastCleanup.current) return;
+    lastCleanup.current = d;
+    if (d.action !== "cleanupLegacy") {
+      setCleanup((cur) => cur && { ...cur, running: false, errors: [...cur.errors, d.error || "Erro desconhecido."] });
+      return;
+    }
+    setCleanup((cur) => cur && {
+      ...cur,
+      scanned: cur.scanned + d.scanned,
+      found: cur.found + d.found,
+      errors: [...cur.errors, ...d.errors],
+      running: d.hasNextPage,
+    });
+    if (d.hasNextPage) {
+      cleanupFetcher.submit({ intent: "cleanupLegacy", dryRun: d.dryRun ? "1" : "0", cursor: d.endCursor }, { method: "post" });
+    }
+  }, [cleanupFetcher.data, cleanupFetcher]);
 
   const isSubmitting = navigation.state === "submitting";
   const isSaving = saveFetcher.state !== "idle";
@@ -1010,6 +1094,9 @@ export default function Bundles() {
               {saveFetcher.data?.error && (
                 <Banner tone="critical" title="Erro ao salvar"><p>{saveFetcher.data.error}</p></Banner>
               )}
+              {saveFetcher.data?.success && saveFetcher.data.warning && (
+                <Banner tone="warning" title="Salvo, com aviso"><p>{saveFetcher.data.warning}</p></Banner>
+              )}
               <Card>
                 <BlockStack gap="400">
                   <Text as="h2" variant="headingMd">Geral</Text>
@@ -1052,6 +1139,9 @@ export default function Bundles() {
                           <Tag key={c.id}>{c.title}</Tag>
                         ))}
                       </InlineStack>
+                      <Text as="p" tone="subdued" variant="bodySm">
+                        A loja confere as collections do produto na hora. A collection precisa estar publicada na Loja Online para o bundle aparecer.
+                      </Text>
                     </BlockStack>
                   )}
                   {b.targets.type === "tags" && (
@@ -1216,9 +1306,49 @@ export default function Bundles() {
           disabled: bundles.length < 2,
           onAction: () => conflictFetcher.submit({ intent: "checkConflicts" }, { method: "post" }),
         },
+        {
+          content: "Regenerar dados ao vivo",
+          loading: isSubmitting && navigation.formData?.get("intent") === "regenerate",
+          onAction: () => runIntent("regenerate"),
+        },
+        {
+          content: "Limpar índice antigo",
+          disabled: !!cleanup?.running,
+          onAction: () => runCleanup(true),
+        },
       ]}
     >
       <BlockStack gap="400">
+        {liveWarning && (
+          <Banner tone="warning" title="Dados ao vivo gerados com aviso"><p>{liveWarning}</p></Banner>
+        )}
+        {cleanup && (
+          <Banner
+            tone={cleanup.errors.length ? "critical" : cleanup.running ? "info" : cleanup.dryRun ? "warning" : "success"}
+            title={
+              cleanup.running
+                ? `${cleanup.dryRun ? "Simulando" : "Limpando"}… ${cleanup.scanned} produto(s) verificados`
+                : cleanup.dryRun
+                  ? `Simulação: ${cleanup.found} produto(s) com índice antigo (de ${cleanup.scanned} verificados)`
+                  : `Limpeza concluída: ${cleanup.found} índice(s) antigo(s) removido(s)`
+            }
+            onDismiss={cleanup.running ? undefined : () => setCleanup(null)}
+          >
+            <BlockStack gap="200">
+              <Text as="p" variant="bodySm">
+                Remove só o metafield antigo <code>brk_bundles.applies</code> dos produtos (o índice que deixava bundle &quot;grudado&quot;). A configuração dos bundles não é alterada.
+              </Text>
+              {cleanup.errors.length > 0 && (
+                <Text as="p" variant="bodySm" tone="critical">{cleanup.errors.slice(0, 5).join(" · ")}</Text>
+              )}
+              {!cleanup.running && cleanup.dryRun && cleanup.found > 0 && (
+                <InlineStack>
+                  <Button tone="critical" onClick={() => runCleanup(false)}>{`Apagar ${cleanup.found} índice(s) antigo(s)`}</Button>
+                </InlineStack>
+              )}
+            </BlockStack>
+          </Banner>
+        )}
         {!hasFn && (
           <Banner tone="warning" title="Function ainda não deployada">
             <p>A discount function "{FN_TITLE}" não foi encontrada. Rode <code>shopify app dev</code> (ou deploy) para os descontos funcionarem.</p>

@@ -564,6 +564,21 @@ const STATUS_TONE = { active: "success", draft: "attention", archived: undefined
 let _keySeq = 0;
 function nextKey() { return `blk_${++_keySeq}`; }
 
+// Sugere o "Valor da opção" pelo título + SKUs das variantes.
+// Prioridade: Envio Imediato > Infantil > Feminina > Masculino.
+function suggestOptionValue(title, variants) {
+  const t = (title || "").toLowerCase();
+  const skus = (variants || []).map((v) => (v?.sku || "").toUpperCase());
+  const skuHas = (s) => skus.some((sku) => sku.includes(s));
+  const isCamis = t.startsWith("camis");
+
+  if (t.includes("imediato") || skuHas("FULL")) return "Envio Imediato";
+  if (t.includes("inf") || (isCamis && skuHas("I"))) return "Infantil";
+  if (skuHas("BL") || t.includes("femi")) return "Feminina";
+  if (isCamis) return "Masculino"; // aqui já não há BL nem I no SKU
+  return "";
+}
+
 function blankGroup() {
   return { _key: nextKey(), id: "", name: "", optionName: "", status: "active", swatchSource: "first", products: [] };
 }
@@ -648,7 +663,7 @@ export default function GruposDeProdutos() {
           handle: p.handle,
           title: p.title,
           image: p.images?.[0]?.originalSrc ?? p.images?.[0]?.src ?? null,
-          value: "",
+          value: suggestOptionValue(p.title, p.variants),
           color: "",
         });
       }

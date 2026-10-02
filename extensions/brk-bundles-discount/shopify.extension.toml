@@ -14,6 +14,12 @@ description = "Aplica o desconto do add-on (brinde 100% / porcentagem / valor fi
   input_query = "src/cart_lines_discounts_generate_run.graphql"
   export = "cart-lines-discounts-generate-run"
 
+  # Variables do input query ($collectionIds, $tags) vêm do mesmo metafield da
+  # discount (chaves de topo), gravado pela rota admin app.bundles.jsx.
+  [extensions.input.variables]
+  namespace = "brk-bundles"
+  key = "config"
+
   [extensions.build]
   command = ""
   path = "dist/function.wasm"
