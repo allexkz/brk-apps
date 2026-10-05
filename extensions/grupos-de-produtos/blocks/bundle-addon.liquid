@@ -12,7 +12,7 @@
   tratados no JS do app embed (assets/bundle.js).
 
   Config de cada bundle (shape gravado pela rota admin app.bundles.jsx):
-    { id, name, enabled, display: 'inline'|'popup', priority, exclusive, chooseMax,
+    { id, name, enabled, display: 'inline'|'popup', priority, exclusive, chooseMax, hidePrice,
       title, subtitle,
       targets: { type, productIds:[num], collectionIds:[num], tags:[str],
                  metafield:{ namespace, key, value } },
@@ -156,6 +156,7 @@
                   {%- endif -%}
                   <span class="brk-bd__info">
                     <span class="brk-bd__name">{{ addon.title }}</span>
+                    {%- unless bundle.hidePrice -%}
                     <span class="brk-bd__price" data-base="{{ base }}">
                       {%- if final != base -%}
                         <s>{{ base | money }}</s> <strong>{{ final | money }}</strong>
@@ -163,6 +164,7 @@
                         {{ base | money }}
                       {%- endif -%}
                     </span>
+                    {%- endunless -%}
                     {%- if addon.variants.size > 1 -%}
                       <span class="brk-bd__variants">
                         {%- for v in addon.variants -%}

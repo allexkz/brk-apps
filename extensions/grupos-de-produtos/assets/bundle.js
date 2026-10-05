@@ -140,8 +140,69 @@
     return vs[0];
   }
 
+  // ── Limite de escolha ("Máx. de add-ons") ────────────────────────────────────
+  // Cada bundle respeita o próprio limite. Além disso, os bundles COM limite (> 0)
+  // do mesmo produto formam um grupo: o total marcado entre eles respeita o MENOR
+  // limite do grupo (ex.: dois bundles com máx. 1 → o cliente escolhe 1 brinde no
+  // total). Bundles sem limite (0) ficam de fora do grupo.
+
+  function chooseMaxOf(el) { return Number(el.getAttribute("data-choose-max")) || 0; }
+
+  function checkedIn(el) {
+    return Array.prototype.slice.call(el.querySelectorAll(".brk-bd__check:checked"));
+  }
+
+  // Desmarca até caber em `max`. Preserva `keep` (o que o cliente acabou de
+  // marcar) e tira primeiro os outros; sem `keep` (estado inicial), tira do fim
+  // — a ordem do DOM é a de prioridade, então o de maior prioridade fica.
+  function trimChecked(checked, max, keep, onUncheck) {
+    while (checked.length > max) {
+      var victim = null;
+      if (keep) {
+        for (var i = 0; i < checked.length; i++) if (checked[i] !== keep) { victim = checked[i]; break; }
+      }
+      victim = victim || checked[checked.length - 1];
+      victim.checked = false;
+      if (onUncheck) onUncheck(victim);
+      checked = checked.filter(function (c) { return c !== victim; });
+    }
+  }
+
+  // Bundles inline do grupo de limite do mesmo produto (wrapper <brk-bundles>).
+  function inlinePool(scope) {
+    var members = Array.prototype.filter.call(
+      (scope || document).querySelectorAll(".brk-bd[data-display='inline']"),
+      function (b) { return chooseMaxOf(b) > 0; }
+    );
+    var max = members.reduce(function (m, b) { return Math.min(m, chooseMaxOf(b)); }, Infinity);
+    return { members: members, max: max };
+  }
+
+  function enforceInline(bd, keep) {
+    var own = chooseMaxOf(bd);
+    if (own > 0) trimChecked(checkedIn(bd), own, keep);
+    if (own <= 0) return;
+    var pool = inlinePool(bd.closest("brk-bundles") || document);
+    if (pool.members.length < 2) return;
+    var all = [];
+    pool.members.forEach(function (b) { all = all.concat(checkedIn(b)); });
+    trimChecked(all, pool.max, keep);
+  }
+
   // Resolve com { action: 'accept'|'decline'|'dismiss', items: [] }
-  function showPopup(popupBundles, triggerId) {
+  // `inline` = { max, used }: limite do grupo inline e quantos já estão marcados.
+  function showPopup(popupBundles, triggerId, inline) {
+    inline = inline || { max: Infinity, used: 0 };
+    // Grupo de limite do popup: bundles com limite, somados ao grupo inline.
+    var poolMax = popupBundles.reduce(function (m, b) {
+      var c = Number(b.chooseMax) || 0;
+      return c > 0 ? Math.min(m, c) : m;
+    }, inline.max);
+    var poolLeft = poolMax - inline.used;
+    // Sem vaga no grupo: bundles com limite não têm o que oferecer no popup.
+    popupBundles = popupBundles.filter(function (b) { return !(Number(b.chooseMax) > 0) || poolLeft > 0; });
+    if (!popupBundles.length) return Promise.resolve({ action: "accept", items: [] });
+
     return new Promise(function (resolve) {
       var overlay = document.createElement("div");
       overlay.className = "brk-bd-popup";
@@ -149,6 +210,17 @@
       card.className = "brk-bd-popup__card";
 
       var chosen = {};
+      var checksByBundle = {}; // bundleId -> [checkbox]
+      var pooledChecks = []; // checkboxes dos bundles com limite
+
+      function forget(chk) { delete chosen[chk.__brkKey]; }
+      function enforcePopup(bundle, keep) {
+        var own = Number(bundle.chooseMax) || 0;
+        if (own <= 0) return;
+        var mine = (checksByBundle[bundle.id] || []).filter(function (c) { return c.checked; });
+        trimChecked(mine, own, keep, forget);
+        trimChecked(pooledChecks.filter(function (c) { return c.checked; }), poolLeft, keep, forget);
+      }
 
       popupBundles.forEach(function (bundle) {
         // título do popup = título do bundle (subtítulo abaixo, se houver)
@@ -179,10 +251,14 @@
           var check = document.createElement("input");
           check.type = "checkbox";
           check.className = "brk-bd__check";
+          check.__brkKey = key;
+          (checksByBundle[bundle.id] = checksByBundle[bundle.id] || []).push(check);
+          if (Number(bundle.chooseMax) > 0) pooledChecks.push(check);
           check.checked = !!addon.preselected;
           if (check.checked) chosen[key] = state;
           check.addEventListener("change", function () {
-            if (check.checked) chosen[key] = state; else delete chosen[key];
+            if (check.checked) { chosen[key] = state; enforcePopup(bundle, check); }
+            else delete chosen[key];
           });
           row.appendChild(check);
 
@@ -199,10 +275,13 @@
           name.className = "brk-bd__name";
           name.textContent = addon.title || "";
           info.appendChild(name);
-          var price = document.createElement("span");
-          price.className = "brk-bd__price";
-          price.innerHTML = priceHTML(sel.priceCents, addon.mode, addon.value);
-          info.appendChild(price);
+          var price = null; // bundle.hidePrice: esconde preço e compare-at
+          if (!bundle.hidePrice) {
+            price = document.createElement("span");
+            price.className = "brk-bd__price";
+            price.innerHTML = priceHTML(sel.priceCents, addon.mode, addon.value);
+            info.appendChild(price);
+          }
 
           if ((addon.variants || []).length > 1) {
             var pillWrap = document.createElement("span");
@@ -219,7 +298,7 @@
                 pillWrap.querySelectorAll(".brk-bd__pill").forEach(function (p) { p.classList.remove("is-active"); });
                 pill.classList.add("is-active");
                 state.variantId = v.variantId;
-                price.innerHTML = priceHTML(v.priceCents, addon.mode, addon.value);
+                if (price) price.innerHTML = priceHTML(v.priceCents, addon.mode, addon.value);
                 if (check.checked) chosen[key] = state;
               });
               pillWrap.appendChild(pill);
@@ -240,6 +319,8 @@
         });
         card.appendChild(list);
       });
+      // pré-seleção acima do limite: mantém os de maior prioridade
+      popupBundles.forEach(function (b) { enforcePopup(b, null); });
 
       var actions = document.createElement("div");
       actions.className = "brk-bd-popup__actions";
@@ -274,7 +355,11 @@
 
   function bindInline(root) {
     (root || document).querySelectorAll(".brk-bd").forEach(function (bd) {
-      var chooseMax = Number(bd.getAttribute("data-choose-max")) || 0;
+      // estado inicial (pré-seleção) dentro do limite, mantendo a maior prioridade
+      if (!bd.__brkInit) {
+        bd.__brkInit = true;
+        enforceInline(bd, null);
+      }
       bd.querySelectorAll(".brk-bd__item").forEach(function (item) {
         var mode = item.getAttribute("data-mode");
         var value = item.getAttribute("data-value");
@@ -283,15 +368,7 @@
         if (check && !check.__brkBound) {
           check.__brkBound = true;
           check.addEventListener("change", function () {
-            if (!check.checked || chooseMax <= 0) return;
-            var checked = Array.prototype.slice.call(bd.querySelectorAll(".brk-bd__check:checked"));
-            while (checked.length > chooseMax) {
-              var victim = null;
-              for (var i = 0; i < checked.length; i++) if (checked[i] !== check) { victim = checked[i]; break; }
-              victim = victim || checked[0];
-              victim.checked = false;
-              checked = checked.filter(function (c) { return c !== victim; });
-            }
+            if (check.checked) enforceInline(bd, check);
           });
         }
 
@@ -370,7 +447,10 @@
 
     if (popupBundles.length) {
       // NÃO adiciona nada até o cliente confirmar
-      showPopup(popupBundles, triggerId).then(function (res) {
+      var pool = inlinePool(scope.querySelector("brk-bundles") || scope);
+      var used = 0;
+      pool.members.forEach(function (b) { used += checkedIn(b).length; });
+      showPopup(popupBundles, triggerId, { max: pool.max, used: used }).then(function (res) {
         if (res.action === "dismiss") return; // cancela: nada é adicionado
         proceed(form, inlineItems.concat(res.items || []));
       });

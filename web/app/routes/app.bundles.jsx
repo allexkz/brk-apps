@@ -788,6 +788,7 @@ function blankBundle() {
     exclusive: false,
     exemption: false, // isenção fiscal: desconto do add-on vai p/ o produto vinculado
     chooseMax: 0, // 0 = sem limite de quantos add-ons o cliente pode marcar
+    hidePrice: false, // esconde preço e preço riscado dos add-ons na página de produto
     title: "Leve também",
     subtitle: "",
     orderTags: [],
@@ -1249,7 +1250,13 @@ export default function Bundles() {
                     value={String(b.chooseMax ?? 0)}
                     onChange={(v) => setField("chooseMax", v === "" ? "" : Number(v))}
                     autoComplete="off"
-                    helpText="Limita quantos itens da lista o cliente marca. 0 = sem limite. Ex.: 1 = escolher só um da lista."
+                    helpText="Limita quantos itens o cliente marca. 0 = sem limite. Se o produto cair em mais de um bundle com limite, o limite vale para todos juntos (o menor deles). Ex.: 1 = o cliente escolhe só um brinde no total."
+                  />
+                  <Checkbox
+                    label="Esconder preços dos add-ons"
+                    helpText="Oculta o preço e o preço riscado (compare-at) dos itens deste bundle na página de produto. O desconto continua valendo no carrinho."
+                    checked={!!b.hidePrice}
+                    onChange={(v) => setField("hidePrice", v)}
                   />
                 </BlockStack>
               </Card>
