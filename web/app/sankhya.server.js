@@ -195,6 +195,24 @@ export async function fetchNunotasByShopifyIds(env, kv, ids, { empresa = null } 
   return map;
 }
 
+// Cabeçalho (TGFCAB) de UM NUNOTA — usado para conferir um Nº Sankhya informado à mão
+// (pedido lançado no Sankhya sem o vínculo AD_PEDECOMMERCE). Retorna
+// { nunota, pedEcommerce, codemp, dtneg } ou null se o NUNOTA não existir.
+export async function fetchCabByNunota(env, kv, nunota) {
+  const n = Number(nunota);
+  if (!Number.isInteger(n) || n <= 0) return null;
+  const sql = `SELECT NUNOTA, ${MATCH_FIELD}, CODEMP, DTNEG FROM TGFCAB WHERE NUNOTA = ${n}`;
+  const rows = await runQuery(env, kv, sql);
+  if (!rows.length) return null;
+  const r = rows[0];
+  return {
+    nunota: r[0],
+    pedEcommerce: r[1] == null ? "" : String(r[1]).trim(),
+    codemp: r[2],
+    dtneg: r[3] == null ? "" : String(r[3]),
+  };
+}
+
 // ── Escrita da personalização no item do pedido ──
 
 // Itens de uma nota (NUNOTA) com o SKU/refs do produto, para casar com a peça

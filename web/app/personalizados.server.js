@@ -19,7 +19,7 @@
 // IMPORTANTE: manter este módulo livre de React/Polaris — o worker.js o importa direto.
 
 import { findSellerForTags } from "./vendedores";
-import { fetchNunotasByShopifyIds, sendPersonalizationsToSankhya } from "./sankhya.server";
+import { fetchCabByNunota, fetchNunotasByShopifyIds, sendPersonalizationsToSankhya } from "./sankhya.server";
 
 export const ORDER_TAG = "Nome Personalizado";
 export const PERSO_SKU = "PE1198";
@@ -595,4 +595,37 @@ export async function completeOrders(kv, shop, legacyIds = []) {
   }
   if (done) await updateSankhyaStatus(kv, shop, updates);
   return { done };
+}
+
+// Vínculo MANUAL do Nº Sankhya (NUNOTA) a um pedido — para pedidos lançados no Sankhya sem o
+// AD_PEDECOMMERCE (o lookup automático nunca os acha e o job fica "pending" para sempre).
+// Confere o NUNOTA no Sankhya antes de gravar no mapa durável; NÃO grava a personalização
+// (o chamador reprocessa em seguida). Retorna { ok, error } ou { ok, cab }.
+export async function setManualNunota(env, kv, shop, legacyId, nunota) {
+  const id = String(legacyId || "").trim();
+  const n = Number(String(nunota ?? "").trim());
+  if (!id) return { ok: false, error: "Pedido inválido." };
+  if (!Number.isInteger(n) || n <= 0) return { ok: false, error: "Nº Sankhya inválido (use só números)." };
+
+  const cab = await fetchCabByNunota(env, kv, n);
+  if (!cab) return { ok: false, error: `Nº Sankhya ${n} não encontrado no Sankhya.` };
+  if (cab.pedEcommerce && cab.pedEcommerce !== id) {
+    return { ok: false, error: `Nº Sankhya ${n} já está vinculado a outro pedido da Shopify (id ${cab.pedEcommerce}).` };
+  }
+
+  const nunotas = await loadNunotas(kv, shop);
+  const other = Object.entries(nunotas).find(([k, v]) => k !== id && String(v) === String(n));
+  if (other) {
+    return { ok: false, error: `Nº Sankhya ${n} já está vinculado a outro pedido na dashboard (id ${other[0]}).` };
+  }
+
+  nunotas[id] = n;
+  await saveNunotas(kv, shop, nunotas);
+
+  // Marca no job (se existir) que o Nº veio manual — só para exibição.
+  const status = await loadSankhyaStatus(kv, shop);
+  if (status[id] && !status[id].nunotaManual) {
+    await updateSankhyaStatus(kv, shop, { [id]: { ...status[id], nunotaManual: true } });
+  }
+  return { ok: true, cab };
 }

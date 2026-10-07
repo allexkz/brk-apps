@@ -46,6 +46,7 @@ import {
   loadSankhyaStatus,
   reprocessOrders,
   completeOrders,
+  setManualNunota,
 } from "../personalizados.server";
 
 // Constantes de EXIBIÇÃO (usadas no componente/client). Não podem vir do módulo
@@ -365,6 +366,39 @@ export const action = async ({ request, context }) => {
       return json({ success: true, action: "markDone", done });
     }
 
+    // "Vincular Nº Sankhya": para pedido lançado no Sankhya sem AD_PEDECOMMERCE (o lookup
+    // automático nunca acha). Confere o NUNOTA informado, grava no mapa durável e já
+    // reprocessa o pedido (grava a personalização), igual ao "Enviar Sankhya". Não mexe no ClickUp.
+    if (intent === "setNunota") {
+      const id = formData.get("id");
+      const legacyId = numericId(id);
+      if (!legacyId) return json({ success: false, error: "Pedido inválido." });
+
+      let link;
+      try {
+        link = await setManualNunota(context.env, kv, session.shop, legacyId, formData.get("nunota"));
+      } catch (e) {
+        return json({ success: false, error: `Sankhya: ${e?.message || e}` });
+      }
+      if (!link.ok) return json({ success: false, error: link.error });
+
+      const { sellers } = await loadSellers(admin);
+      const res = await admin.graphql(
+        `query ($ids: [ID!]!) { nodes(ids: $ids) { ... on Order { ${ORDER_FIELDS} } } }`,
+        { variables: { ids: [id] } }
+      );
+      const data = await res.json();
+      const ods = (data.data.nodes || []).filter(Boolean).map((n) => buildOrderData(n, ""));
+
+      let summary;
+      try {
+        summary = await reprocessOrders(context.env, kv, session.shop, ods, sellers);
+      } catch (e) {
+        return json({ success: true, action: "setNunota", nunota: link.cab.nunota, sent: 0, errors: [`Sankhya: ${e?.message || e}`] });
+      }
+      return json({ success: true, action: "setNunota", nunota: link.cab.nunota, ...summary });
+    }
+
     const token = context.env.CLICKUP_TOKEN;
     if (!token) return json({ success: false, error: "CLICKUP_TOKEN não configurado no worker." });
 
@@ -671,6 +705,21 @@ export default function Personalizados() {
     clearSelection();
   }, [selectedResources, submit, clearSelection]);
 
+  // Vínculo manual do Nº Sankhya (modal do pedido). Fecha o modal: o resultado vai no banner
+  // e a lista recarrega com o Nº novo (o activeOrder do modal é um snapshot).
+  const [nunotaInput, setNunotaInput] = useState("");
+  const doSetNunota = useCallback(() => {
+    const nunota = nunotaInput.trim();
+    if (!activeOrder || !nunota) return;
+    const fd = new FormData();
+    fd.set("intent", "setNunota");
+    fd.set("id", activeOrder.id);
+    fd.set("nunota", nunota);
+    submit(fd, { method: "post" });
+    setActiveOrder(null);
+    setNunotaInput("");
+  }, [activeOrder, nunotaInput, submit]);
+
   const pendingCount = useMemo(
     () => orders.filter((o) => !sent[o.id]).length,
     [orders, sent]
@@ -898,6 +947,21 @@ export default function Personalizados() {
             )}
           </Banner>
         )}
+        {actionData?.success && actionData.action === "setNunota" && (
+          <Banner
+            tone={actionData.sent > 0 ? "success" : "warning"}
+            title={actionData.sent > 0
+              ? `Nº Sankhya ${actionData.nunota} vinculado e personalização gravada.`
+              : `Nº Sankhya ${actionData.nunota} vinculado, mas a personalização não foi gravada.`}
+          >
+            {actionData.errors?.length > 0 && (
+              <Text as="p" variant="bodySm">Erros: {actionData.errors.join(" · ")}</Text>
+            )}
+            {!actionData.errors?.length && actionData.sent === 0 && (
+              <Text as="p" variant="bodySm">Confira o status Sankhya do pedido (vendedor sem atributos ou sem personalização).</Text>
+            )}
+          </Banner>
+        )}
         {actionData?.success && actionData.action === "markDone" && (
           <Banner tone="success" title={`${actionData.done} pedido(s) concluído(s) — removidos do alerta de pendências.`} />
         )}
@@ -1057,7 +1121,7 @@ export default function Personalizados() {
       {activeOrder && (
         <Modal
           open
-          onClose={() => setActiveOrder(null)}
+          onClose={() => { setActiveOrder(null); setNunotaInput(""); }}
           title={`Pedido ${activeOrder.name}`}
           size="large"
         >
@@ -1066,7 +1130,11 @@ export default function Personalizados() {
               <InlineStack gap="200" blockAlign="center" wrap>
                 <Text as="span" variant="bodyMd" fontWeight="bold">{activeOrder.customer || "—"}</Text>
                 <Text as="span" tone="subdued">{new Date(activeOrder.createdAt).toLocaleDateString("pt-BR")}</Text>
-                {activeOrder.nunota != null && <Badge tone="info">Nº Sankhya: {activeOrder.nunota}</Badge>}
+                {activeOrder.nunota != null && (
+                  <Badge tone="info">
+                    {`Nº Sankhya: ${activeOrder.nunota}${sankhyaStatus[activeOrder.legacyId]?.nunotaManual ? " (manual)" : ""}`}
+                  </Badge>
+                )}
                 {activeOrder.variacao.map((v) => <Badge key={v} tone={VARIACAO_TONE[v]}>{v}</Badge>)}
                 {sellerByOrder[activeOrder.id] && <Badge tone="info">Vendedor: {sellerByOrder[activeOrder.id]}</Badge>}
                 {activeOrder.hasFull && <Badge tone="critical">Envio Imediato (FULL)</Badge>}
@@ -1097,6 +1165,40 @@ export default function Personalizados() {
                 <Text as="p" variant="bodySm" tone="subdued">
                   Sankhya: {sankhyaStatus[activeOrder.legacyId].reason}
                 </Text>
+              )}
+
+              {sankhyaStatus[activeOrder.legacyId]?.status !== "sent" && (
+                <Box padding="300" background="bg-surface-secondary" borderRadius="200">
+                  <BlockStack gap="200">
+                    <Text as="p" variant="bodySm" fontWeight="bold">
+                      {activeOrder.nunota == null ? "Vincular Nº Sankhya manualmente" : "Corrigir Nº Sankhya"}
+                    </Text>
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      Para pedido lançado no Sankhya sem o vínculo com a Shopify. Informe o Nro Único
+                      (NUNOTA), não o nº da nota fiscal. O número é conferido no Sankhya e a
+                      personalização é gravada em seguida.
+                    </Text>
+                    <InlineStack gap="200" blockAlign="end" wrap={false}>
+                      <div style={{ flex: 1, maxWidth: 240 }}>
+                        <TextField
+                          label="Nº Sankhya (NUNOTA)"
+                          labelHidden
+                          placeholder="Ex.: 1619183"
+                          inputMode="numeric"
+                          value={nunotaInput}
+                          onChange={(v) => setNunotaInput(v.replace(/\D/g, ""))}
+                          autoComplete="off"
+                        />
+                      </div>
+                      <Button
+                        onClick={doSetNunota}
+                        disabled={!nunotaInput.trim() || isSubmitting}
+                      >
+                        Vincular e gravar
+                      </Button>
+                    </InlineStack>
+                  </BlockStack>
+                </Box>
               )}
 
               {activeOrder.note && (
