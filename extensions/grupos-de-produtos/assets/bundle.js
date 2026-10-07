@@ -7,6 +7,8 @@
  * - Limite por carrinho: `maxQty` do item (0 = ilimitado) impede adicionar mais
  *   unidades do add-on do que o permitido (checando /cart.js antes). Com "Limite
  *   por produto do bundle", o limite vale por unidade dos produtos que o puxaram.
+ * - Compra fora do <form> (ex.: modal de personalização do tema): `window.BRKBundles`
+ *   (ver "API pública" abaixo).
  * (Funciona na página de produto; a Compra Rápida/quick view não é suportada.)
  *
  * Properties da linha do add-on: `_brk_bundle`, `_brk_bundle_item` (id do produto
@@ -91,6 +93,58 @@
     }).then(function (r) { return r.json(); });
   }
 
+  function isCartError(res) { return !res || Number(res.status) >= 400; }
+
+  // Quantidade das linhas de add-on por variante + bundle + item (o que agrupa uma linha).
+  function lineKey(variantId, props) {
+    return variantId + "::" + props._brk_bundle + "::" + props._brk_bundle_item;
+  }
+  function addonLineQty(cart) {
+    var out = {};
+    (cart.items || []).forEach(function (li) {
+      var p = li.properties || {};
+      if (!p._brk_bundle || !p._brk_bundle_item) return;
+      var k = lineKey(li.variant_id, p);
+      out[k] = (out[k] || 0) + li.quantity;
+    });
+    return out;
+  }
+  // itens filtrados (filterByCartLimit) -> linhas de add-on no carrinho naquele momento
+  var BASELINE = typeof WeakMap === "function" ? new WeakMap() : null;
+
+  // Adiciona os add-ons em lote. Um add-on esgotado faz a Shopify recusar o lote
+  // inteiro (422) e os outros brindes se perdiam junto; aí tenta um a um os que não
+  // entraram. Compara com o carrinho de antes do lote para não duplicar o que entrou
+  // parcialmente (sem estoque suficiente a Shopify adiciona o disponível e ainda
+  // responde 422). Nunca rejeita; resolve true se algum add-on entrou.
+  function addAddonsSafe(items) {
+    if (!items || !items.length) return Promise.resolve(false);
+    var base = BASELINE && BASELINE.get(items);
+    return addItemsSilent(items)
+      .then(function (res) {
+        if (!isCartError(res)) return true;
+        if (!base || items.length < 2) return false;
+        return fetch("/cart.js")
+          .then(function (r) { return r.json(); })
+          .then(function (cart) {
+            var now = addonLineQty(cart);
+            var pending = items.filter(function (it) {
+              var k = lineKey(it.id, it.properties);
+              return (now[k] || 0) <= (base[k] || 0);
+            });
+            return pending.reduce(function (p, it) {
+              return p.then(function (ok) {
+                return addItemsSilent([it]).then(
+                  function (r) { return ok || !isCartError(r); },
+                  function () { return ok; }
+                );
+              });
+            }, Promise.resolve(pending.length < items.length));
+          });
+      })
+      .catch(function () { return false; });
+  }
+
   function addonItem(bundleId, itemId, variantId, triggerId) {
     var props = { _brk_bundle: bundleId, _brk_bundle_item: String(itemId) };
     if (triggerId) props._brk_bundle_trigger = String(triggerId);
@@ -145,6 +199,7 @@
           }
           if (max <= 0 || have < max) { out.push(it); counts[k] = have + 1; }
         });
+        if (BASELINE) BASELINE.set(out, addonLineQty(cart));
         return out;
       })
       .catch(function () { return items; });
@@ -458,8 +513,26 @@
     var btn = form.querySelector('[type="submit"]');
     if (btn) btn.classList.add("loading");
     filterByCartLimit(addonItems, formQty(form)).then(function (items) {
-      var pre = items.length ? addItemsSilent(items) : Promise.resolve();
-      pre.catch(function () {}).then(function () { submitMain(form, btn); });
+      addAddonsSafe(items).then(function () { submitMain(form, btn); });
+    });
+  }
+
+  function popupBundlesIn(scope) {
+    return readBundles(scope).filter(function (b) {
+      return b.display === "popup" && b.addons && b.addons.length;
+    });
+  }
+
+  // Add-ons inline marcados + os escolhidos no popup (se houver bundle popup).
+  // Resolve com os itens, ou null se o cliente fechou o popup (cancela a compra).
+  function chooseItems(scope, triggerId, inlineItems, popupBundles) {
+    if (!popupBundles.length) return Promise.resolve(inlineItems);
+    var pool = inlinePool(scope.querySelector("brk-bundles") || scope);
+    var used = 0;
+    pool.members.forEach(function (b) { used += checkedIn(b).length; });
+    return showPopup(popupBundles, triggerId, { max: pool.max, used: used }).then(function (res) {
+      if (res.action === "dismiss") return null;
+      return inlineItems.concat(res.items || []);
     });
   }
 
@@ -470,27 +543,61 @@
     var scope = scopeFor(form);
     var triggerId = triggerFor(scope);
     var inlineItems = inlineSelectedItems(scope, triggerId);
-    var popupBundles = readBundles(scope).filter(function (b) {
-      return b.display === "popup" && b.addons && b.addons.length;
-    });
+    var popupBundles = popupBundlesIn(scope);
     if (inlineItems.length === 0 && popupBundles.length === 0) return;
 
     e.preventDefault();
     if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
 
-    if (popupBundles.length) {
-      // NÃO adiciona nada até o cliente confirmar
-      var pool = inlinePool(scope.querySelector("brk-bundles") || scope);
-      var used = 0;
-      pool.members.forEach(function (b) { used += checkedIn(b).length; });
-      showPopup(popupBundles, triggerId, { max: pool.max, used: used }).then(function (res) {
-        if (res.action === "dismiss") return; // cancela: nada é adicionado
-        proceed(form, inlineItems.concat(res.items || []));
-      });
-    } else {
-      proceed(form, inlineItems);
-    }
+    // popup: NÃO adiciona nada até o cliente confirmar; fechar = cancela
+    chooseItems(scope, triggerId, inlineItems, popupBundles).then(function (items) {
+      if (items) proceed(form, items);
+    });
   }
+
+  // ── API pública (compra fora do <form>) ───────────────────────────────────
+  // Fluxos do tema que adicionam ao carrinho por fetch próprio, como o modal de
+  // personalização (custom-name-modal.js, botão .cnm__buy), não disparam o submit
+  // do form, então os add-ons não entravam. Eles chamam esta API:
+  //
+  //   var items = await BRKBundles.prepareAddons({ quantity: 1 }); // ANTES do add do base
+  //   if (items === null) return;  // cliente fechou o popup → cancela a compra
+  //   ...add do produto base (request do próprio tema)...
+  //   if (items.length) await BRKBundles.addAddons(items);          // DEPOIS que o base entrou
+  //
+  // O limite (maxQty / limite por produto do bundle) é calculado no prepare, com o
+  // carrinho de ANTES do base; por isso o base não pode entrar antes do prepare.
+  // Contrato estável: o tema depende destes nomes.
+
+  function scopeForProduct(productId) {
+    var sel = productId
+      ? 'brk-bundles[data-product-id="' + String(productId) + '"]'
+      : "brk-bundles[data-product-id]";
+    var el = document.querySelector(sel);
+    if (!el) return null;
+    return el.closest(".product-detail__information, .product-detail, main") || document;
+  }
+
+  window.BRKBundles = {
+    version: 1,
+    // opts: { quantity = 1, productId? } → Promise<items[] | null>
+    prepareAddons: function (opts) {
+      opts = opts || {};
+      var scope = scopeForProduct(opts.productId);
+      if (!scope) return Promise.resolve([]);
+      var triggerId = triggerFor(scope);
+      var inlineItems = inlineSelectedItems(scope, triggerId);
+      var popupBundles = popupBundlesIn(scope);
+      if (inlineItems.length === 0 && popupBundles.length === 0) return Promise.resolve([]);
+      return chooseItems(scope, triggerId, inlineItems, popupBundles).then(function (items) {
+        if (!items) return null;
+        return filterByCartLimit(items, opts.quantity);
+      });
+    },
+    // Adiciona os itens do prepare (passe o MESMO array). Nunca rejeita: falha no
+    // add-on não deve desfazer a compra do produto base (mesmo comportamento do form).
+    addAddons: addAddonsSafe,
+  };
 
   function bindForms(root) {
     var selector = CONFIG.productFormSelector || 'form[action*="/cart/add"]';
