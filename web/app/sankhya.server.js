@@ -213,6 +213,35 @@ export async function fetchCabByNunota(env, kv, nunota) {
   };
 }
 
+// ── SKU original por CODPROD (tela "SKUs Sankhya") ──
+
+// Produtos cadastrados na Shopify com o CODPROD do Sankhya no SKU (ex.: "12905") em vez
+// do código original ("C01828PP"). Retorna { codprod(string) -> { idExterno, descricao } }:
+// `idExterno` = AD_IDEXTERNO2 (SKU limpo); `descricao` = DESCRPROD, cujo prefixo antes do
+// " - " é o fallback/conferência. Só aceita CODPROD numérico de até 10 dígitos (sem zeros à
+// esquerda) — é inteiro no Sankhya, então vai no IN sem aspas. Lotes de 500 por SQL.
+export async function fetchSkusByCodprod(env, kv, codprods) {
+  const clean = [
+    ...new Set(
+      (codprods || [])
+        .map((x) => String(x ?? "").trim().replace(/^0+(?=\d)/, ""))
+        .filter((x) => /^\d{1,10}$/.test(x))
+    ),
+  ];
+  const map = {};
+  for (const part of chunk(clean, 500)) {
+    const sql = `SELECT CODPROD, ${PROD_SKU_FIELD}, DESCRPROD FROM TGFPRO WHERE CODPROD IN (${part.join(",")})`;
+    const rows = await runQuery(env, kv, sql); // rows: [ [CODPROD, AD_IDEXTERNO2, DESCRPROD], ... ]
+    for (const r of rows) {
+      map[String(r[0])] = {
+        idExterno: r[1] == null ? "" : String(r[1]).trim(),
+        descricao: r[2] == null ? "" : String(r[2]).trim().slice(0, 120),
+      };
+    }
+  }
+  return map;
+}
+
 // ── Escrita da personalização no item do pedido ──
 
 // Itens de uma nota (NUNOTA) com o SKU/refs do produto, para casar com a peça
