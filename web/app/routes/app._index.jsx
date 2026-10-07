@@ -36,6 +36,13 @@ const MODULES = [
     description:
       "Lista os pedidos com cupom de TROCA e verifica se o frete grátis foi aplicado corretamente.",
   },
+  {
+    // Fora do NavMenu: ferramenta de manutenção, usada sob demanda.
+    title: "SKUs Sankhya",
+    url: "/app/skus-sankhya",
+    description:
+      "Acha variantes com o código do Sankhya (só números) no SKU e troca em massa pelo SKU original do produto.",
+  },
 ];
 
 export default function Index() {
