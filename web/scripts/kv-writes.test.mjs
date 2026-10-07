@@ -12,6 +12,7 @@
 import {
   drainSankhyaQueue,
   completeOrders,
+  setManualNunota,
 } from "../app/personalizados.server.js";
 import {
   getSankhyaToken,
@@ -179,6 +180,35 @@ async function run() {
     cfg.nunotaRows = [[5001, "111"]];                   // mesmo com NUNOTA disponível…
     const drain = await drainSankhyaQueue(env, kv, SHOP);
     check("cron NÃO reprocessa pedido concluído", drain.processed === 0, JSON.stringify(drain));
+  }
+
+  // ── Cenário F: vínculo manual do Nº Sankhya (pedido lançado sem AD_PEDECOMMERCE) ──
+  console.log("Cenário F — setManualNunota: vínculo manual do Nº Sankhya:");
+  {
+    const kv = makeKV(seedPending());
+    cfg.nunotaRows = [];                                // NUNOTA não existe na TGFCAB
+    const notFound = await setManualNunota(env, kv, SHOP, "111", "1619183");
+    check("NUNOTA inexistente é recusado", !notFound.ok && /não encontrado/.test(notFound.error), JSON.stringify(notFound));
+    const invalid = await setManualNunota(env, kv, SHOP, "111", "16a9");
+    check("NUNOTA não numérico é recusado", !invalid.ok, JSON.stringify(invalid));
+    cfg.nunotaRows = [[1619183, "999", 2, "01/10/2026"]]; // NUNOTA de OUTRO pedido Shopify
+    const otherCab = await setManualNunota(env, kv, SHOP, "111", "1619183");
+    check("NUNOTA com AD_PEDECOMMERCE de outro pedido é recusado", !otherCab.ok && /outro pedido da Shopify/.test(otherCab.error), JSON.stringify(otherCab));
+    check("nada gravado no mapa após recusas", (await kv.get(NUNOTA_KEY, "json"))?.["111"] == null);
+
+    cfg.nunotaRows = [[1619183, null, 2, "01/10/2026"]];  // NUNOTA sem vínculo → aceito
+    const ok = await setManualNunota(env, kv, SHOP, "111", "1619183");
+    check("NUNOTA válido é vinculado", ok.ok && ok.cab?.nunota === 1619183, JSON.stringify(ok));
+    check("mapa de nunotas atualizado", (await kv.get(NUNOTA_KEY, "json"))?.["111"] === 1619183);
+    check("job marcado nunotaManual", (await kv.get(STATUS_KEY, "json"))?.["111"]?.nunotaManual === true);
+
+    const dup = await setManualNunota(env, kv, SHOP, "222", "1619183");
+    check("mesmo NUNOTA em outro pedido da dashboard é recusado", !dup.ok && /na dashboard/.test(dup.error), JSON.stringify(dup));
+
+    cfg.itemRows = [[1, 10, "C0492G", "C0492G - CAMISA"]];
+    const drain = await drainSankhyaQueue(env, kv, SHOP);
+    check("pendente com Nº manual é gravado no próximo dreno", drain.sent === 1, JSON.stringify(drain));
+    check("status = sent", (await kv.get(STATUS_KEY, "json"))?.["111"]?.status === "sent");
   }
 
   console.log("");

@@ -5,7 +5,8 @@
  * - Modo popup: o produto base só é adicionado DEPOIS que o cliente confirma
  *   (aceitar = base + upsell; recusar = só base; fechar = cancela).
  * - Limite por carrinho: `maxQty` do item (0 = ilimitado) impede adicionar mais
- *   unidades do add-on do que o permitido (checando /cart.js antes).
+ *   unidades do add-on do que o permitido (checando /cart.js antes). Com "Limite
+ *   por produto do bundle", o limite vale por unidade dos produtos que o puxaram.
  * (Funciona na página de produto; a Compra Rápida/quick view não é suportada.)
  *
  * Properties da linha do add-on: `_brk_bundle`, `_brk_bundle_item` (id do produto
@@ -35,8 +36,10 @@
 
   // Registro global (mesclado à medida que modais carregam) só para o maxQty.
   var MAX_BY_KEY = {};
+  var PER_TRIGGER = {}; // bundleId -> "Limite por produto do bundle"
   function register(root) {
     readBundles(root).forEach(function (b) {
+      PER_TRIGGER[b.id] = !!b.limitPerTrigger;
       (b.addons || []).forEach(function (a) {
         MAX_BY_KEY[b.id + "::" + a.productId] = a.maxQty == null ? 1 : Number(a.maxQty);
       });
@@ -100,17 +103,28 @@
   }
 
   // Remove os add-ons que já atingiram o limite (maxQty) no carrinho. 0 = ilimitado.
-  function filterByCartLimit(items) {
+  // Com "Limite por produto do bundle", o limite vale por unidade dos produtos que
+  // puxaram o add-on (os já no carrinho + `baseQty` do que está sendo adicionado),
+  // e o add-on entra na quantidade que ainda cabe (ex.: 2ª camisa → 2º brinde).
+  function filterByCartLimit(items, baseQty) {
     if (!items.length) return Promise.resolve(items);
+    baseQty = Math.max(1, Number(baseQty) || 1);
     return fetch("/cart.js")
       .then(function (r) { return r.json(); })
       .then(function (cart) {
         var counts = {};
+        var triggers = {}; // bundleId -> { pid: 1 } gravados nas linhas do bundle
+        var unitsByPid = {}; // unidades de cada produto fora de bundle
         (cart.items || []).forEach(function (li) {
           var p = li.properties || {};
           if (p._brk_bundle && p._brk_bundle_item) {
             var k = p._brk_bundle + "::" + p._brk_bundle_item;
             counts[k] = (counts[k] || 0) + li.quantity;
+            if (p._brk_bundle_trigger) {
+              (triggers[p._brk_bundle] = triggers[p._brk_bundle] || {})[String(p._brk_bundle_trigger)] = 1;
+            }
+          } else {
+            unitsByPid[String(li.product_id)] = (unitsByPid[String(li.product_id)] || 0) + li.quantity;
           }
         });
         var out = [];
@@ -119,11 +133,30 @@
           var max = itemMaxQty(b, id);
           var k = b + "::" + id;
           var have = counts[k] || 0;
+          if (max > 0 && PER_TRIGGER[b]) {
+            var set = {};
+            Object.keys(triggers[b] || {}).forEach(function (pid) { set[pid] = 1; });
+            if (it.properties._brk_bundle_trigger) set[String(it.properties._brk_bundle_trigger)] = 1;
+            var units = baseQty;
+            Object.keys(set).forEach(function (pid) { units += unitsByPid[pid] || 0; });
+            var qty = Math.min(max * units - have, max * baseQty);
+            if (qty > 0) { it.quantity = qty; out.push(it); counts[k] = have + qty; }
+            return;
+          }
           if (max <= 0 || have < max) { out.push(it); counts[k] = have + 1; }
         });
         return out;
       })
       .catch(function () { return items; });
+  }
+
+  // Quantidade do produto base no formulário (input dentro do form ou ligado por `form=`).
+  // getAttribute: `form.id` devolve o <input name="id"> da variante, não o id do form.
+  function formQty(form) {
+    var formId = form.getAttribute("id");
+    var input = form.querySelector('[name="quantity"]') ||
+      (formId ? document.querySelector('[name="quantity"][form="' + formId + '"]') : null);
+    return Math.max(1, Number(input && input.value) || 1);
   }
 
   // ── Popup ─────────────────────────────────────────────────────────────────
@@ -424,7 +457,7 @@
   function proceed(form, addonItems) {
     var btn = form.querySelector('[type="submit"]');
     if (btn) btn.classList.add("loading");
-    filterByCartLimit(addonItems).then(function (items) {
+    filterByCartLimit(addonItems, formQty(form)).then(function (items) {
       var pre = items.length ? addItemsSilent(items) : Promise.resolve();
       pre.catch(function () {}).then(function () { submitMain(form, btn); });
     });

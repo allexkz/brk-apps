@@ -308,6 +308,7 @@ function buildDiscountConfig(bundles) {
       i[String(a.productId)] = it;
     }
     const entry = { i };
+    if (b.limitPerTrigger) entry.u = 1;
     const t = b.targets || {};
     if (t.type === "products") {
       entry.t = { k: "p", ids: (t.productIds || []).map(Number) };
@@ -331,7 +332,7 @@ function buildDiscountConfig(bundles) {
 
   // Grande demais: tira a validação de segmentação (só items).
   const slim = { v: 2, L: labels, collectionIds: [], tags: [], b: {} };
-  for (const [id, e] of Object.entries(map)) slim.b[id] = { i: e.i };
+  for (const [id, e] of Object.entries(map)) slim.b[id] = e.u ? { i: e.i, u: 1 } : { i: e.i };
   if (bytes(slim) <= DISCOUNT_MAX_BYTES) {
     warnings.push("Config de desconto grande demais para validar a segmentação no checkout (limite de 10 KB da Shopify Function). Os descontos seguem funcionando sem essa validação.");
     return { value: JSON.stringify(slim), warnings };
@@ -787,6 +788,8 @@ function blankBundle() {
     priority: 0,
     exclusive: false,
     exemption: false, // isenção fiscal: desconto do add-on vai p/ o produto vinculado
+    showAddonDiscount: false, // isenção: no cart/minicart exibe o desconto no add-on (só visual, tema)
+    limitPerTrigger: false, // "Máx. c/ desconto" vale por produto do bundle no carrinho, não pelo carrinho todo
     chooseMax: 0, // 0 = sem limite de quantos add-ons o cliente pode marcar
     hidePrice: false, // esconde preço e preço riscado dos add-ons na página de produto
     title: "Leve também",
@@ -1179,6 +1182,20 @@ export default function Bundles() {
                     onChange={(v) => setField("exemption", v)}
                     helpText="O add-on sai a preço cheio e o valor do desconto dele é abatido do produto que disparou o bundle. O total do cliente não muda."
                   />
+                  {b.exemption && (
+                    <Checkbox
+                      label="Mostrar desconto do add-on no carrinho"
+                      checked={!!b.showAddonDiscount}
+                      onChange={(v) => setField("showAddonDiscount", v)}
+                      helpText="Só visual, no carrinho e no minicart: o add-on aparece com o desconto e o produto vinculado aparece sem ele. No checkout continua a divisão real."
+                    />
+                  )}
+                  <Checkbox
+                    label="Limite por produto do bundle"
+                    checked={!!b.limitPerTrigger}
+                    onChange={(v) => setField("limitPerTrigger", v)}
+                    helpText={'O "Máx. c/ desconto" de cada add-on passa a valer para cada produto do bundle no carrinho. Ex.: máx. 1 + 2 camisas = até 2 brindes. Se o cliente tirar uma camisa, o brinde continua valendo pela outra. Desligado, o máximo vale para o carrinho todo.'}
+                  />
                   {b.addons.length === 0 && <Text as="p" tone="subdued">Nenhum add-on. Clique em "Selecionar produtos".</Text>}
                   <BlockStack gap="300">
                     {b.addons.map((a) => {
@@ -1485,6 +1502,7 @@ export default function Bundles() {
                           <InlineStack gap="150" blockAlign="center">
                             <Badge tone={b.enabled ? "success" : undefined}>{b.enabled ? "Ativo" : "Desativado"}</Badge>
                             {b.exemption && <Badge tone="info">Isenção</Badge>}
+                            {b.limitPerTrigger && <Badge>Limite por produto</Badge>}
                             <Text as="span" tone="subdued" variant="bodySm">Prioridade {b.priority ?? 0}{b.exclusive ? " · exclusivo" : ""}</Text>
                           </InlineStack>
                         </BlockStack>
