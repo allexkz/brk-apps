@@ -1,34 +1,23 @@
+// Dashboard de pedidos personalizados — paginada pela Shopify + Polaris web components.
+//
+// Cada acesso busca só a página pedida direto da Admin API (ver personalizados-page.server.js):
+// sem o cache de ~1 MB no KV que estourava a CPU do Worker (Error 1102). Abas, busca e
+// período viram parâmetros de URL (a Shopify filtra/ordena/pagina).
+//
+// UI: Polaris web components (<s-*>, carregados em app.jsx). Regras p/ React 18:
+//   - nunca passar `false` em prop booleana (use `cond || undefined`);
+//   - valores/eventos via `e.currentTarget.value|checked` (eventos nativos).
+
 import { json } from "@remix-run/cloudflare";
 import {
-  useLoaderData,
   useActionData,
-  useSubmit,
+  useLoaderData,
+  useLocation,
   useNavigation,
-  useNavigate,
+  useSearchParams,
+  useSubmit,
 } from "@remix-run/react";
-import { useState, useCallback, useMemo, useEffect } from "react";
-import {
-  Page,
-  Card,
-  BlockStack,
-  InlineStack,
-  Text,
-  Button,
-  Banner,
-  Badge,
-  Box,
-  Link,
-  EmptyState,
-  IndexTable,
-  useIndexResourceState,
-  Modal,
-  Thumbnail,
-  Divider,
-  ButtonGroup,
-  Select,
-  Pagination,
-  TextField,
-} from "@shopify/polaris";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { getShopify } from "../shopify.server";
 import { loadSellers, findSellerForTags, normalizeStr } from "../vendedores";
@@ -38,9 +27,6 @@ import {
   ORDER_FIELDS,
   numericId,
   buildOrderData,
-  buildPersoQuery,
-  buildOrdersPayload,
-  mergePersoOrders,
   loadNunotas,
   saveNunotas,
   loadSankhyaStatus,
@@ -48,11 +34,32 @@ import {
   completeOrders,
   setManualNunota,
 } from "../personalizados.server";
+import { TABS, D1_TABS, PAGE_SIZES, DEFAULT_PAGE_SIZE, STUCK_MIN, BULK_CHUNK } from "../personalizados-shared";
+import {
+  CU_NS,
+  CU_KEY,
+  LEGACY_CLICKUP_DUAL_WRITE,
+  loadPersoPage,
+  mapStore,
+  loadLegacySent,
+  setOrderClickupMetafields,
+  syncClickupChunk,
+  ensureClickupDefinitions,
+  syncScanChunk,
+  markScanDone,
+  exportClickupLegacy,
+} from "../personalizados-page.server";
+import { getD1Store, exportToKv, reimportFromKv } from "../perso-store.server";
 
-// Constantes de EXIBIÇÃO (usadas no componente/client). Não podem vir do módulo
-// `.server` (Remix o remove do bundle client). Fonte de verdade da lógica está lá.
-const ORDER_TAG = "Nome Personalizado";
-const MAX_ORDERS = 2000;
+// Store do estado Sankhya: D1 (custo constante) ou, sem PERSO_DB, os mapas antigos do KV.
+async function storeFor(env, kv, shop) {
+  const d1 = await getD1Store(env, kv, shop);
+  if (d1) return d1;
+  const [statusMap, nunotas] = await Promise.all([loadSankhyaStatus(kv, shop), loadNunotas(kv, shop)]);
+  const s = mapStore(statusMap, nunotas);
+  s.saveNunotas = async (found) => saveNunotas(kv, shop, { ...nunotas, ...found });
+  return s;
+}
 
 // ── ClickUp (board "FORMATAÇÃO 2026", grupo "entrada diária") ──
 const CLICKUP_LIST_ID = "901306145937";
@@ -73,47 +80,23 @@ const CU_FIELD_CANAL_NAME = "Canal"; // labels — recebe a loja (BRKAGRO/BRKFIS
 const CU_CANAL = "BRKAGRO"; // label do "Canal" desta loja
 const CU_FIELD_VENDEDOR_NAME = "Vendedores E-commerce";
 
-const SENT_NS = "brk_perso";
-const SENT_KEY = "clickup_sent";
+const ORDER_TAG = "Nome Personalizado";
 
 // ── Helpers ClickUp / metafield ──
 
-function parseJsonMetafield(value) {
-  try {
-    return value ? JSON.parse(value) : {};
-  } catch {
-    return {};
-  }
-}
-
-// Shop id + mapa de status do ClickUp (lido fresco a cada request).
-async function loadSent(admin) {
-  const res = await admin.graphql(
-    `query { shop { id metafield(namespace: "${SENT_NS}", key: "${SENT_KEY}") { value } } }`
-  );
-  const data = await res.json();
-  return { shopId: data.data.shop.id, sent: parseJsonMetafield(data.data.shop.metafield?.value) };
-}
-
-async function saveSent(admin, shopId, sent) {
+async function saveLegacySent(admin, shopId, sent) {
   const res = await admin.graphql(
     `mutation set($metafields: [MetafieldsSetInput!]!) {
       metafieldsSet(metafields: $metafields) { userErrors { field message } }
     }`,
     {
       variables: {
-        metafields: [{
-          ownerId: shopId,
-          namespace: SENT_NS,
-          key: SENT_KEY,
-          type: "json",
-          value: JSON.stringify(sent),
-        }],
+        metafields: [{ ownerId: shopId, namespace: CU_NS, key: "clickup_sent", type: "json", value: JSON.stringify(sent) }],
       },
     }
   );
   const data = await res.json();
-  return data.data.metafieldsSet.userErrors;
+  return data.data?.metafieldsSet?.userErrors || [];
 }
 
 async function clickupCreateTask(token, payload) {
@@ -152,148 +135,71 @@ function clickupOptionId(field, optionName) {
   return null;
 }
 
+// Pedidos selecionados (com o metafield do ClickUp) — usado pelas actions.
+const NODES_QUERY = `query ($ids: [ID!]!) {
+  shop { primaryDomain { url } }
+  nodes(ids: $ids) { ... on Order { ${ORDER_FIELDS} clickup: metafield(namespace: "${CU_NS}", key: "${CU_KEY}") { value } } }
+}`;
+
 // ── Loader ──
 
-// Cache do payload em KV (persistido, sem TTL) + atualização INCREMENTAL por janela:
-// a dashboard SEMPRE abre com os dados persistidos e, ao atualizar, buscamos só os
-// pedidos da janela recente (created_at) e mesclamos por legacyId no cache. Nunca
-// re-paginamos os ~2 meses inteiros — isso estourava o teto de subrequests do Worker
-// (50/invocação no plano Free), derrubando o "Atualizar" com Application Error.
-const ORDERS_REVALIDATE_AFTER = 300; // s: idade a partir da qual revalida em background
-// (5 min: cada revalidação regrava o cache no KV — 1 PUT. Como PUT é o recurso escasso do
-// free tier, revalidamos com menos frequência; a dashboard segue abrindo instantânea via
-// cache, e o botão "Atualizar" (?refresh=1) força o fetch imediato quando preciso.)
-
-const DAY_MS = 86400000;
-const REFRESH_WINDOW_CAP_DAYS = 30; // teto da janela padrão (trava de subrequests)
-const toShopDate = (ms) => new Date(ms).toISOString().slice(0, 10); // YYYY-MM-DD
-
-// Início padrão da janela: desde a última busca bem-sucedida (com 1 dia de folga p/ pegar
-// o que entrou logo após), limitado a REFRESH_WINDOW_CAP_DAYS atrás. Sem cache anterior
-// (cold start), volta o teto inteiro.
-function defaultSince(fetchedAt) {
-  const floorMs = Date.now() - REFRESH_WINDOW_CAP_DAYS * DAY_MS;
-  const baseMs = fetchedAt ? fetchedAt - DAY_MS : floorMs;
-  return toShopDate(Math.max(baseMs, floorMs));
-}
+const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
 export const loader = async ({ request, context }) => {
   const shopify = getShopify(context.env);
   const { admin, session } = await shopify.authenticate.admin(request);
-
-  // `?refresh=1` atualiza a janela recente e mescla no cache. `since`/`until` (YYYY-MM-DD)
-  // = período personalizado; ausentes → janela padrão (desde a última busca bem-sucedida).
-  const url = new URL(request.url);
-  const forceRefresh = url.searchParams.has("refresh");
-  const sinceParam = url.searchParams.get("since");
-  const untilParam = url.searchParams.get("until");
-
-  const { sellers } = await loadSellers(admin);
-
-  // Status "enviado" ao ClickUp (fresco): usado para puxar o Nº Sankhya SÓ dos pendentes.
-  const { sent } = await loadSent(admin);
-
   const kv = context.env.SESSIONS;
-  const kvKey = `personalizados:orders:${session.shop}`;
-  const waitUntil = context.cloudflare?.ctx?.waitUntil?.bind(context.cloudflare.ctx);
+  const p = new URL(request.url).searchParams;
 
-  // Base de merge: SEMPRE o payload em cache (persistido). Nunca re-paginamos tudo.
-  let cached = null;
-  if (kv) {
-    try { cached = await kv.get(kvKey, "json"); } catch { cached = null; }
-  }
-
-  // Busca a janela [since, until] e mescla na base; grava o resultado no KV. Limita a
-  // MAX_ORDERS (mantém os mais novos) pra não inflar o payload no KV indefinidamente.
-  const buildWindow = async ({ since, until = null, base }) => {
-    const windowed = await buildOrdersPayload(admin, buildPersoQuery(sellers, { since, until }));
-    const mergedFull = base?.orders ? mergePersoOrders(base.orders, windowed.orders) : windowed.orders;
-    const orders = mergedFull.slice(0, MAX_ORDERS);
-    const next = {
-      orders,
-      truncated: windowed.truncated || mergedFull.length > MAX_ORDERS,
-      fetchedAt: Date.now(),
-      lastWindow: { since, until: until || toShopDate(Date.now()) },
-    };
-    if (kv) await kv.put(kvKey, JSON.stringify(next));
-    return next;
+  const filters = {
+    tab: TABS.includes(p.get("tab")) ? p.get("tab") : "todos",
+    q: (p.get("q") || "").slice(0, 100),
+    de: isDate(p.get("de")) ? p.get("de") : "",
+    ate: isDate(p.get("ate")) ? p.get("ate") : "",
+    size: PAGE_SIZES.includes(Number(p.get("size"))) ? Number(p.get("size")) : DEFAULT_PAGE_SIZE,
   };
+  const cursor = p.get("before") ? { before: p.get("before") } : p.get("after") ? { after: p.get("after") } : {};
 
-  let payload = cached;
-  let refreshError = null;
+  const [{ sellers }, store] = await Promise.all([loadSellers(admin), storeFor(context.env, kv, session.shop)]);
 
-  if (forceRefresh) {
-    // Atualização manual (botão padrão ou período personalizado): janela + merge.
-    try {
-      const since = sinceParam || defaultSince(cached?.fetchedAt);
-      payload = await buildWindow({ since, until: untilParam || null, base: cached });
-    } catch (e) {
-      console.error("[personalizados refresh]", e);
-      refreshError = e?.message || String(e);
-      payload = cached; // degrada pro cache — nunca derruba a página (sem Application Error)
-    }
-  } else if (!payload) {
-    // Cold start (KV vazio/perdido): sem base. Tenta um build limitado à janela-teto; se
-    // ainda estourar, entrega vazio + aviso (dá pra reconstruir por períodos, que mesclam).
-    try {
-      payload = await buildWindow({ since: defaultSince(null), base: null });
-    } catch (e) {
-      console.error("[personalizados cold]", e);
-      refreshError = e?.message || String(e);
-      payload = { orders: [], truncated: false, fetchedAt: null, lastWindow: null };
-    }
-  } else {
-    // Load normal com cache: revalida em background (janela incremental) se estiver velho.
-    const ageMs = Date.now() - (payload.fetchedAt || 0);
-    if (ageMs > ORDERS_REVALIDATE_AFTER * 1000 && waitUntil) {
-      const base = payload;
-      waitUntil(
-        buildWindow({ since: defaultSince(base.fetchedAt), base }).catch((e) =>
-          console.error("[personalizados revalidate]", e)
-        )
-      );
-    }
+  let page = null;
+  let error = null;
+  try {
+    page = await loadPersoPage(admin, { ...filters, cursor, sellers, store, nowTs: Date.now() });
+  } catch (e) {
+    if (e instanceof Response) throw e;
+    console.error("[personalizados page]", e);
+    error = e?.message || String(e);
   }
 
-  // Nº Sankhya durável (KV): a coluna SEMPRE lê daqui, então nunca some ao enviar.
-  const nunotas = await loadNunotas(kv, session.shop);
+  // "Atualizar" (?refresh=1): puxa o Nº Sankhya dos pedidos DA PÁGINA ainda não enviados ao
+  // ClickUp e sem Nº, e grava (só esses). O resto da página é relido da Shopify.
   let sankhyaError = null;
-  // No "Atualizar" manual, puxa o Nº Sankhya dos PENDENTES que ainda não têm, e persiste.
-  if (forceRefresh && payload?.orders?.length) {
-    try {
-      const pendingIds = payload.orders
-        .filter((o) => !sent[o.id] && nunotas[o.legacyId] == null)
-        .map((o) => o.legacyId)
-        .filter(Boolean);
-      if (pendingIds.length) {
+  if (p.has("refresh") && page?.rows?.length) {
+    const pendingIds = page.rows.filter((r) => !r.clickup && r.nunota == null).map((r) => r.legacyId);
+    if (pendingIds.length) {
+      try {
         const fetched = await fetchNunotasByShopifyIds(context.env, kv, pendingIds, { empresa: SANKHYA_EMPRESA });
-        if (Object.keys(fetched).length) {
-          Object.assign(nunotas, fetched);
-          await saveNunotas(kv, session.shop, nunotas);
+        const found = {};
+        for (const [id, nu] of Object.entries(fetched)) if (nu != null) found[id] = nu;
+        if (Object.keys(found).length) {
+          await store.saveNunotas(found);
+          for (const r of page.rows) if (found[r.legacyId] != null) r.nunota = found[r.legacyId];
         }
+      } catch (e) {
+        console.error("[personalizados sankhya]", e);
+        sankhyaError = e?.message || String(e);
       }
-    } catch (e) {
-      console.error("[personalizados sankhya]", e);
-      sankhyaError = e?.message || String(e);
     }
   }
-  const list = payload?.orders || [];
-  for (const o of list) o.nunota = nunotas[o.legacyId] ?? null;
-
-  // Status do envio ao Sankhya (KV) — alimenta a coluna "Sankhya" + contadores + saúde.
-  const sankhyaStatus = await loadSankhyaStatus(kv, session.shop);
 
   return json({
-    orders: list,
-    truncated: payload?.truncated || false,
-    fetchedAt: payload?.fetchedAt || null,
-    lastWindow: payload?.lastWindow || null,
-    refreshError,
+    filters,
+    page,
+    error,
     sankhyaError,
-    sent,
-    sankhyaStatus,
-    sellers,
     hasToken: Boolean(context.env.CLICKUP_TOKEN),
+    storeKind: store.kind, // "d1" (custo constante) | "map" (fallback sem PERSO_DB)
   });
 };
 
@@ -308,32 +214,86 @@ export const action = async ({ request, context }) => {
     const formData = await request.formData();
     const intent = formData.get("intent");
 
-    // "Atualizar Banco": puxa o Nº Sankhya de TODOS os pedidos e grava no mapa durável.
-    // NÃO altera o status (não mexe em "enviado"). Uso pontual para backfill do histórico.
-    // Lê os ids do payload em cache (KV) — NÃO re-pagina a Shopify (isso estourava o teto
-    // de subrequests do Worker); o cache já contém todo o histórico mesclado.
+    // Sincronização única (não destrutiva): copia os envios antigos (metafield da LOJA, que
+    // fica intacto) para os metafields de cada pedido, em fatias retomáveis.
+    if (intent === "syncClickup") {
+      const offset = Math.max(0, Number(formData.get("offset")) || 0);
+      const dryRun = formData.get("dryRun") === "1";
+      // 1ª fatia: repassa KV → D1 (só acrescenta o que faltar) — cobre pedidos gravados no
+      // KV pela versão anterior durante a troca de versão do deploy.
+      if (offset === 0 && !dryRun && (await getD1Store(context.env, kv, session.shop))) {
+        await reimportFromKv(context.env, kv, session.shop);
+      }
+      // 1ª fatia: garante as definições dos metafields de pedido do ClickUp (lojas novas).
+      if (offset === 0 && !dryRun) {
+        const defs = await ensureClickupDefinitions(admin);
+        if (defs.errors.length) return json({ success: false, error: `Definições de metafield: ${defs.errors.join(", ")}` });
+      }
+      const r = await syncClickupChunk(admin, { offset, dryRun });
+      return json({ success: true, action: "syncClickup", ...r });
+    }
+
+    // Sincronização única (2ª etapa): varre os pedidos com PE1198 em fatias (cursor da
+    // Shopify) e registra no D1 os "sem atributos" e os pedidos de vendedor (jeito antigo).
+    if (intent === "syncScan") {
+      const store = await getD1Store(context.env, kv, session.shop);
+      if (!store) return json({ success: true, action: "syncScan", next: null, skipped: true });
+      const { sellers } = await loadSellers(admin);
+      const r = await syncScanChunk(admin, store, sellers, { after: formData.get("after") || null });
+      if (r.next == null) await markScanDone(admin);
+      return json({ success: true, action: "syncScan", ...r });
+    }
+
+    // "Atualizar Banco": puxa o Nº Sankhya dos pedidos que ainda não têm, em LOTES de 200
+    // (os mais novos primeiro); clicar de novo continua. NÃO altera o status.
     if (intent === "refreshNunotas") {
-      const cached = await kv.get(`personalizados:orders:${session.shop}`, "json").catch(() => null);
-      const orders = cached?.orders || [];
-      const nunotas = await loadNunotas(kv, session.shop);
-      const ids = orders.map((o) => o.legacyId).filter(Boolean);
+      const store = await getD1Store(context.env, kv, session.shop);
+      let ids;
+      if (store) {
+        ids = await store.idsWithoutNunota(200, formData.get("before") || null);
+      } else {
+        const statusMap = await loadSankhyaStatus(kv, session.shop);
+        const nunotas = await loadNunotas(kv, session.shop);
+        ids = Object.keys(statusMap).filter((id) => statusMap[id]?.status !== "seller" && nunotas[id] == null).slice(0, 200);
+      }
       let matched = 0;
       try {
         const fetched = await fetchNunotasByShopifyIds(context.env, kv, ids, { empresa: SANKHYA_EMPRESA });
-        for (const [legacyId, nu] of Object.entries(fetched)) {
-          if (nu != null) { nunotas[legacyId] = nu; matched++; }
-        }
-        await saveNunotas(kv, session.shop, nunotas);
+        const found = {};
+        for (const [legacyId, nu] of Object.entries(fetched)) if (nu != null) { found[legacyId] = nu; matched++; }
+        if (store) await store.saveNunotas(found);
+        else await saveNunotas(kv, session.shop, { ...(await loadNunotas(kv, session.shop)), ...found });
       } catch (e) {
         return json({ success: false, error: `Sankhya: ${e?.message || e}` });
       }
-      return json({ success: true, action: "refreshNunotas", matched, total: orders.length });
+      return json({ success: true, action: "refreshNunotas", matched, total: ids.length, more: ids.length === 200 });
+    }
+
+    // ── Manutenção (raro, só por botão) ──
+    // Recalcula os contadores do D1 a partir das linhas (corrige qualquer divergência).
+    if (intent === "recountCounters") {
+      const store = await getD1Store(context.env, kv, session.shop);
+      if (!store) return json({ success: false, error: "D1 (PERSO_DB) não configurado." });
+      await store.recountCounters();
+      return json({ success: true, action: "maintenance", message: "Contadores recalculados." });
+    }
+    // Rollback: regera os mapas antigos do KV (status + Nº Sankhya) a partir do D1, para a
+    // versão anterior do app voltar com os dados atuais. Guarda cópia dos valores anteriores.
+    if (intent === "exportKv") {
+      if (!(await getD1Store(context.env, kv, session.shop))) return json({ success: false, error: "D1 (PERSO_DB) não configurado." });
+      const r = await exportToKv(context.env, kv, session.shop);
+      return json({ success: true, action: "maintenance", message: `Formato antigo (KV) regerado: ${r.jobs} pedidos, ${r.nunotas} Nº Sankhya.` });
+    }
+    // Rollback do ClickUp: regera o mapa antigo da loja (`clickup_sent`) a partir dos
+    // metafields de pedido (só acrescenta; nunca remove entradas).
+    if (intent === "exportClickupLegacy") {
+      const r = await exportClickupLegacy(admin);
+      if (r.errors.length) return json({ success: false, error: r.errors.join(", ") });
+      return json({ success: true, action: "maintenance", message: `Mapa antigo do ClickUp regerado: +${r.merged} envio(s), ${r.total} no total${r.complete ? "" : " (parcial — clique de novo)"}.` });
     }
 
     // "Enviar Sankhya" (reprocessar/backfill manual): busca os pedidos selecionados,
     // faz upsert dos jobs (pulando vendedores) e grava a personalização no Sankhya já.
-    // O envio automático (webhook + cron) cobre os pedidos novos; este botão serve para
-    // pedidos antigos e retentativa de erro. Independe do ClickUp.
     if (intent === "sendSankhya") {
       const ids = JSON.parse(formData.get("ids") || "[]");
       if (ids.length === 0) return json({ success: false, error: "Nenhum pedido selecionado." });
@@ -355,20 +315,16 @@ export const action = async ({ request, context }) => {
       return json({ success: true, action: "sendSankhya", ...summary });
     }
 
-    // "Concluir": marca os selecionados como RESOLVIDOS/encerrados (status Sankhya "done"),
-    // tirando-os do alerta de pendências e do reenvio automático. NÃO marca ClickUp/Sankhya como
-    // enviado/gravado — só encerra a fila do "tem algo a fazer". Reversível pelo "Enviar Sankhya".
+    // "Concluir": marca os selecionados como RESOLVIDOS/encerrados (status Sankhya "done").
     if (intent === "markDone") {
       const ids = JSON.parse(formData.get("ids") || "[]");
       if (ids.length === 0) return json({ success: false, error: "Nenhum pedido selecionado." });
       const legacyIds = ids.map((g) => numericId(g)).filter(Boolean);
-      const { done } = await completeOrders(kv, session.shop, legacyIds);
+      const { done } = await completeOrders(kv, session.shop, legacyIds, context.env);
       return json({ success: true, action: "markDone", done });
     }
 
-    // "Vincular Nº Sankhya": para pedido lançado no Sankhya sem AD_PEDECOMMERCE (o lookup
-    // automático nunca acha). Confere o NUNOTA informado, grava no mapa durável e já
-    // reprocessa o pedido (grava a personalização), igual ao "Enviar Sankhya". Não mexe no ClickUp.
+    // "Vincular Nº Sankhya": confere o NUNOTA, grava no mapa durável e reprocessa o pedido.
     if (intent === "setNunota") {
       const id = formData.get("id");
       const legacyId = numericId(id);
@@ -409,17 +365,13 @@ export const action = async ({ request, context }) => {
     const ids = JSON.parse(formData.get("ids") || "[]");
     if (ids.length === 0) return json({ success: false, error: "Nenhum pedido selecionado." });
 
-    const { shopId, sent } = await loadSent(admin);
     const { sellers } = await loadSellers(admin);
+    // Formato antigo (mapa da loja): só é lido/regravado com a gravação dupla LIGADA
+    // (LEGACY_CLICKUP_DUAL_WRITE). Desligada, "já enviado" vem só do metafield do pedido e o
+    // custo do envio não depende do histórico.
+    const legacy = LEGACY_CLICKUP_DUAL_WRITE ? await loadLegacySent(admin) : { shopId: null, sent: {} };
 
-    // Busca os pedidos selecionados em lote
-    const res = await admin.graphql(
-      `query ($ids: [ID!]!) {
-        shop { primaryDomain { url } }
-        nodes(ids: $ids) { ... on Order { ${ORDER_FIELDS} } }
-      }`,
-      { variables: { ids } }
-    );
+    const res = await admin.graphql(NODES_QUERY, { variables: { ids } });
     const data = await res.json();
     const shopDomain = data.data.shop.primaryDomain.url;
     const orders = (data.data.nodes || []).filter(Boolean);
@@ -428,23 +380,25 @@ export const action = async ({ request, context }) => {
     let skipped = 0;
     let skippedExpired = 0;
     const errors = [];
+    const newlySent = []; // [{ orderGid, info }]
 
-    // Nº Sankhya dos selecionados: puxa fresco do Sankhya e PERSISTE no mapa durável
-    // (assim NÃO some ao enviar). Se a busca falhar, usa o que já está salvo no mapa.
-    const nunotas = await loadNunotas(kv, session.shop);
+    // Nº Sankhya dos selecionados: o que já temos + fresco do Sankhya (persiste só esses).
+    const store = await storeFor(context.env, kv, session.shop);
+    const legacyIdsSel = orders.map((n) => n.legacyResourceId || numericId(n.id)).filter(Boolean);
+    const nunotas = await store.getNunotas(legacyIdsSel);
     try {
-      const legacyIds = orders.map((n) => n.legacyResourceId || numericId(n.id)).filter(Boolean);
-      const fetched = await fetchNunotasByShopifyIds(context.env, kv, legacyIds, { empresa: SANKHYA_EMPRESA });
-      if (Object.keys(fetched).length) {
-        Object.assign(nunotas, fetched);
-        await saveNunotas(kv, session.shop, nunotas);
+      const fetched = await fetchNunotasByShopifyIds(context.env, kv, legacyIdsSel, { empresa: SANKHYA_EMPRESA });
+      const found = {};
+      for (const [id, nu] of Object.entries(fetched)) if (nu != null) found[id] = nu;
+      if (Object.keys(found).length) {
+        Object.assign(nunotas, found);
+        await store.saveNunotas(found);
       }
     } catch (e) {
       errors.push(`Sankhya: ${e.message}`);
     }
 
-    // Custom fields do ClickUp resolvidos por nome (uma leitura, reaproveitada no lote):
-    // "Vendedores E-commerce", "Data de Entrada" e "Nº Sankhya".
+    // Custom fields do ClickUp resolvidos por nome (uma leitura, reaproveitada no lote).
     let cuFields = null;
     let cuFieldsError = null;
     try {
@@ -458,7 +412,6 @@ export const action = async ({ request, context }) => {
     if (cuFields && !sankhyaField) {
       errors.push(`Campo "${CU_FIELD_SANKHYA_NAME}" não existe no ClickUp — Nro Único não enviado. Crie o field na lista.`);
     }
-    // "Canal" (label da loja) — resolvido uma vez (constante por app).
     const canalField = cuFields?.[normalizeStr(CU_FIELD_CANAL_NAME)] || null;
     const canalOptId = canalField ? clickupOptionId(canalField, CU_CANAL) : null;
     if (cuFields && !canalField) {
@@ -472,7 +425,8 @@ export const action = async ({ request, context }) => {
       // Pedido expirado (pagamento não concluído) nunca vira tarefa no ClickUp —
       // vale inclusive para "Forçar reenvio". Pode continuar indo ao Sankhya.
       if (od.expired) { skippedExpired++; continue; }
-      if (!force && sent[od.id]) { skipped++; continue; }
+      const alreadySent = Boolean(node.clickup?.value) || Boolean(legacy.sent[od.id]);
+      if (!force && alreadySent) { skipped++; continue; }
       if (od.rawPersoCount === 0) { skipped++; continue; }
 
       const seller = findSellerForTags(od.tags, sellers);
@@ -484,24 +438,19 @@ export const action = async ({ request, context }) => {
         { id: CU_FIELD_MODALIDADE, value: [CU_OPT_ECOMMERCE] },
         { id: CU_FIELD_VARIACAO, value: variacaoIds },
       ];
-
-      // "Data de Entrada" = data de criação do pedido (ClickUp date = epoch ms).
       if (dataEntradaField) {
         custom_fields.push({ id: dataEntradaField.id, value: new Date(od.createdAt).getTime() });
       }
-      // "Nº Sankhya" = NUNOTA. Field Number recebe número; texto recebe string.
       if (sankhyaField && nunota != null) {
         const value = sankhyaField.type === "number" ? Number(nunota) : String(nunota);
         custom_fields.push({ id: sankhyaField.id, value });
       }
-      // "Canal" = loja (label).
       if (canalField && canalOptId) {
         custom_fields.push({ id: canalField.id, value: [canalOptId] });
       }
 
-      // Descrição: com atributos estruturados (site OU block do vendedor) usa os
-      // blocos estruturados — igual aos outros pedidos. Só o vendedor no jeito
-      // ANTIGO (personalização na nota, sem atributos) usa a nota.
+      // Descrição: com atributos estruturados usa os blocos; só o vendedor no jeito ANTIGO
+      // (personalização na nota, sem atributos) usa a nota.
       let description;
       if (od.hasAttributes) {
         description = od.description;
@@ -511,8 +460,6 @@ export const action = async ({ request, context }) => {
         description = od.description;
       }
 
-      // Atribuição do vendedor: seta a label "Vendedores E-commerce" (mesmo com
-      // título/descrição normais), para saber quem vendeu.
       if (seller) {
         if (vendedorField) {
           const optId = clickupOptionId(vendedorField, seller.name);
@@ -526,11 +473,8 @@ export const action = async ({ request, context }) => {
         }
       }
 
-      // Título: sempre "Pedido {NUNOTA}" (fallback pro #pedido se ainda não
-      // sincronizou no Sankhya). O vendedor vai no campo "Vendedores E-commerce".
-      const taskName = `Pedido ${nunota ?? od.name}`;
       const payload = {
-        name: taskName,
+        name: `Pedido ${nunota ?? od.name}`,
         status: CU_STATUS,
         description,
         custom_fields,
@@ -538,15 +482,25 @@ export const action = async ({ request, context }) => {
 
       try {
         const task = await clickupCreateTask(token, payload);
-        sent[od.id] = { taskId: task.id, url: task.url, name: od.name, sentAt: new Date().toISOString() };
+        const info = { taskId: task.id, url: task.url, name: od.name, sentAt: new Date().toISOString() };
+        newlySent.push({ orderGid: od.id, info });
+        legacy.sent[od.id] = info;
         created++;
       } catch (err) {
         errors.push(`${od.name}: ${err.message}`);
       }
     }
 
-    const metaErrs = await saveSent(admin, shopId, sent);
-    if (metaErrs.length) errors.push(metaErrs.map((e) => e.message).join(", "));
+    if (newlySent.length) {
+      // 1) Metafields do pedido (fonte da dashboard: abas Pendentes/Enviados).
+      const mf = await setOrderClickupMetafields(admin, newlySent);
+      if (mf.errors.length) errors.push(`Marcação no pedido: ${mf.errors.join(", ")}`);
+      // 2) Gravação dupla no formato antigo (mapa da loja) — só se ligada (rollback).
+      if (LEGACY_CLICKUP_DUAL_WRITE) {
+        const legacyErrs = await saveLegacySent(admin, legacy.shopId, legacy.sent);
+        if (legacyErrs.length) errors.push(legacyErrs.map((e) => e.message).join(", "));
+      }
+    }
 
     return json({ success: true, action: "send", created, skipped, skippedExpired, errors });
   } catch (err) {
@@ -558,729 +512,779 @@ export const action = async ({ request, context }) => {
 
 // ── Component ──
 
-const VARIACAO_TONE = { Masculina: "info", Feminina: "magic", Infantil: "attention" };
+const TZ = "America/Sao_Paulo"; // SSR (UTC) e navegador formatam igual → sem hydration mismatch
+const fmtDate = (iso) => (iso ? new Date(iso).toLocaleDateString("pt-BR", { timeZone: TZ }) : "—");
+const fmtDateTime = (iso) =>
+  iso
+    ? new Date(iso).toLocaleString("pt-BR", { timeZone: TZ, day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" })
+    : "—";
 
-// Badge de status do envio ao Sankhya (usa o mapa KV por legacyId).
-function sankhyaBadge(st) {
-  let badge;
-  if (!st) {
-    badge = <Badge>Não enviado</Badge>;
-  } else if (st.status === "sent") {
-    badge = <Badge tone="success">{st.written ? `Gravado (${st.written})` : "Gravado"}</Badge>;
-  } else if (st.status === "done") {
-    badge = <Badge>Concluído</Badge>;
-  } else if (st.status === "seller") {
-    badge = <Badge tone="info">Vendedor (n/e)</Badge>;
-  } else if (st.status === "hold") {
-    badge = <Badge>Em análise</Badge>;
-  } else if (st.status === "error") {
-    badge = <Badge tone="critical">Erro</Badge>;
-  } else {
-    badge = <Badge tone="attention">Pendente</Badge>;
-  }
-  return st?.reason ? <span title={st.reason}>{badge}</span> : badge;
+const VARIACAO_TONE = { Masculina: "info", Feminina: "caution", Infantil: "warning" };
+const TAB_LABELS = {
+  todos: "Todos",
+  pendentes: "Pendentes",
+  enviados: "Enviados",
+  semAtributos: "Sem atributos",
+  presos: "Presos no Sankhya",
+};
+
+function SankhyaBadge({ st }) {
+  let tone = "neutral";
+  let label = "Não enviado";
+  if (st?.status === "sent") { tone = "success"; label = st.written ? `Gravado (${st.written})` : "Gravado"; }
+  else if (st?.status === "done") { label = "Concluído"; }
+  else if (st?.status === "seller") { tone = "info"; label = "Vendedor (n/e)"; }
+  else if (st?.status === "hold") { label = "Em análise"; }
+  else if (st?.status === "error") { tone = "critical"; label = "Erro"; }
+  else if (st) { tone = "warning"; label = "Pendente"; }
+  return <s-badge tone={tone} title={st?.reason || undefined}>{label}</s-badge>;
 }
 
-// Idade (min) a partir da qual um pendente do Sankhya é considerado "preso" (envio automático
-// possivelmente travado). ~3 ciclos do cron de 15 min.
-const STUCK_MIN = 45;
-// "Preso" = status Sankhya "pending" há mais de STUCK_MIN. `nowTs` injetado (SSR/testável).
-function isStuckPending(st, nowTs) {
-  if (!(st?.status === "pending" && st.at)) return false;
-  return Math.floor((nowTs - new Date(st.at).getTime()) / 60000) >= STUCK_MIN;
+function ClickupBadge({ row }) {
+  if (row.clickup) return <s-badge tone="success">Enviado</s-badge>;
+  if (row.expired) return <s-badge tone="critical">Expirado — não enviar</s-badge>;
+  return <s-badge tone="neutral">Pendente</s-badge>;
+}
+
+const post = (submit, fields) => {
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(fields)) if (v != null) fd.set(k, String(v));
+  submit(fd, { method: "post" });
+};
+
+// Sincronização única em 2 etapas, cada uma em fatias até `next` == null:
+//   1) envios antigos ao ClickUp → metafields de pedido (offset)
+//   2) varredura dos pedidos com PE1198 → "sem atributos"/vendedores no D1 (cursor)
+function useSync() {
+  const submit = useSubmit();
+  const actionData = useActionData();
+  const seen = useRef(null);
+  const [st, setSt] = useState({ phase: null, done: 0, total: 0, scanned: 0, errors: [], finished: false });
+
+  useEffect(() => {
+    const d = actionData;
+    if (!st.phase || !d || seen.current === d) return;
+    if (d.action !== "syncClickup" && d.action !== "syncScan") return;
+    seen.current = d;
+    if (d.action === "syncClickup") {
+      setSt((s) => ({ ...s, done: s.done + (d.written || 0), total: d.total, errors: [...s.errors, ...(d.errors || [])] }));
+      if (d.next != null) post(submit, { intent: "syncClickup", offset: d.next });
+      else {
+        setSt((s) => ({ ...s, phase: "scan" }));
+        post(submit, { intent: "syncScan" });
+      }
+    } else {
+      setSt((s) => ({ ...s, scanned: s.scanned + (d.scanned || 0) }));
+      if (d.next) post(submit, { intent: "syncScan", after: d.next });
+      else setSt((s) => ({ ...s, phase: null, finished: true }));
+    }
+  }, [actionData, st.phase, submit]);
+
+  const start = useCallback(() => {
+    setSt({ phase: "clickup", done: 0, total: 0, scanned: 0, errors: [], finished: false });
+    post(submit, { intent: "syncClickup", offset: 0 });
+  }, [submit]);
+
+  return { ...st, running: Boolean(st.phase), start };
+}
+
+// Ações em lote em fatias de BULK_CHUNK pedidos (uma request por fatia), somando os resultados.
+function useBulk() {
+  const submit = useSubmit();
+  const actionData = useActionData();
+  const seen = useRef(null);
+  const [bulk, setBulk] = useState(null); // { intent, queue, agg, total, done, finished }
+
+  useEffect(() => {
+    const d = actionData;
+    if (!bulk || bulk.finished || !d || seen.current === d) return;
+    seen.current = d;
+    setBulk((b) => {
+      const agg = { ...b.agg };
+      if (d.error) agg.errors = [...agg.errors, d.error];
+      for (const k of ["created", "skipped", "skippedExpired", "sent", "pending", "sellers", "done"]) {
+        if (typeof d[k] === "number") agg[k] = (agg[k] || 0) + d[k];
+      }
+      if (Array.isArray(d.errors)) agg.errors = [...agg.errors, ...d.errors];
+      const next = b.queue.slice(0, BULK_CHUNK);
+      const rest = b.queue.slice(BULK_CHUNK);
+      if (next.length) post(submit, { intent: b.intent, ids: JSON.stringify(next) });
+      return { ...b, agg, queue: rest, done: b.total - b.queue.length, finished: next.length === 0 };
+    });
+  }, [actionData, bulk, submit]);
+
+  const start = useCallback(
+    (intent, ids) => {
+      const first = ids.slice(0, BULK_CHUNK);
+      setBulk({ intent, queue: ids.slice(BULK_CHUNK), total: ids.length, done: 0, agg: { errors: [] }, finished: false });
+      post(submit, { intent, ids: JSON.stringify(first) });
+    },
+    [submit]
+  );
+
+  return { bulk, start, clear: () => setBulk(null) };
 }
 
 export default function Personalizados() {
-  const { orders, sent, sankhyaStatus, sellers, hasToken, truncated, sankhyaError, refreshError, fetchedAt, lastWindow } = useLoaderData();
+  const { filters, page, error, sankhyaError, hasToken, storeKind } = useLoaderData();
   const actionData = useActionData();
   const submit = useSubmit();
-  const navigate = useNavigate();
   const navigation = useNavigation();
-  const isSubmitting = navigation.state === "submitting";
+  const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
 
-  // Navegando para o próprio dashboard com ?refresh=1 = atualização em andamento.
-  const isRefreshing =
-    navigation.state === "loading" &&
-    (navigation.location?.search || "").includes("refresh");
+  const rows = page?.rows || [];
+  const pageInfo = page?.pageInfo || {};
+  const counts = page?.counts || null;
+  const stuck = page?.stuck || { count: 0, oldestMin: 0 };
+  const migracao = page?.migracao || null;
 
-  const [activeOrder, setActiveOrder] = useState(null);
-  const [filter, setFilter] = useState("todos"); // todos | enviados | pendentes | semAtributos
-  const [pageSize, setPageSize] = useState("25");
-  const [page, setPage] = useState(0);
-  const [search, setSearch] = useState("");
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+  const busyIntent = navigation.state === "submitting" ? navigation.formData?.get("intent") : null;
+  const loadingList =
+    navigation.state === "loading" && navigation.location?.pathname === location.pathname;
 
-  // Modal "Atualizar período" — janela personalizada (created_at). `until` vazio = hoje.
-  const [periodOpen, setPeriodOpen] = useState(false);
-  const [periodSince, setPeriodSince] = useState("");
-  const [periodUntil, setPeriodUntil] = useState("");
-  const doRefreshPeriod = useCallback(() => {
-    if (!periodSince) return;
-    const qs = new URLSearchParams({ refresh: "1", since: periodSince });
-    if (periodUntil) qs.set("until", periodUntil);
-    setPeriodOpen(false);
-    navigate(`/app/personalizados?${qs.toString()}`);
-  }, [periodSince, periodUntil, navigate]);
-
-  const filteredOrders = useMemo(() => {
-    const q = normalizeStr(search.trim());
-    const fromTs = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : null;
-    const toTs = dateTo ? new Date(`${dateTo}T23:59:59.999`).getTime() : null;
-    const nowTs = Date.now();
-    return orders.filter((o) => {
-      // status (segmented)
-      if (filter === "enviados" && !sent[o.id]) return false;
-      if (filter === "pendentes" && sent[o.id]) return false;
-      if (filter === "semAtributos" && o.hasAttributes) return false;
-      if (filter === "presos" && !isStuckPending(sankhyaStatus[o.legacyId], nowTs)) return false;
-      // intervalo de datas (por data de criação do pedido)
-      if (fromTs || toTs) {
-        const ts = new Date(o.createdAt).getTime();
-        if (fromTs && ts < fromTs) return false;
-        if (toTs && ts > toTs) return false;
+  // ── Filtros na URL (a Shopify filtra/pagina) ──
+  const update = useCallback(
+    (patch) => {
+      const next = new URLSearchParams(searchParams);
+      for (const [k, v] of Object.entries(patch)) {
+        if (v == null || v === "") next.delete(k);
+        else next.set(k, String(v));
       }
-      // busca textual (pedido, cliente, nome, SKU, vendedor, nota, variação)
-      if (q) {
-        const seller = findSellerForTags(o.tags, sellers);
-        const hay = normalizeStr(
-          [
-            o.name,
-            o.customer,
-            o.legacyId,
-            String(o.nunota ?? ""),
-            o.note,
-            (o.tags || []).join(" "),
-            (o.variacao || []).join(" "),
-            seller?.name || "",
-            (o.personalizations || []).map((p) => `${p.sku} ${p.nome} ${p.title}`).join(" "),
-          ].join(" ")
-        );
-        if (!hay.includes(q)) return false;
-      }
-      return true;
-    });
-  }, [orders, sent, sellers, filter, search, dateFrom, dateTo, sankhyaStatus]);
-
-  const size = Number(pageSize);
-  const totalPages = Math.max(1, Math.ceil(filteredOrders.length / size));
-  const safePage = Math.min(page, totalPages - 1);
-  const pagedOrders = filteredOrders.slice(safePage * size, safePage * size + size);
-
-  const setFilterAndReset = useCallback((f) => { setFilter(f); setPage(0); }, []);
-
-  const { selectedResources, allResourcesSelected, handleSelectionChange, clearSelection } =
-    useIndexResourceState(pagedOrders);
-
-  const doSend = useCallback((force) => {
-    if (selectedResources.length === 0) return;
-    const fd = new FormData();
-    fd.set("intent", force ? "sendForce" : "send");
-    fd.set("ids", JSON.stringify(selectedResources));
-    submit(fd, { method: "post" });
-    clearSelection();
-  }, [selectedResources, submit, clearSelection]);
-
-  const doRefreshBanco = useCallback(() => {
-    const fd = new FormData();
-    fd.set("intent", "refreshNunotas");
-    submit(fd, { method: "post" });
-  }, [submit]);
-
-  const doSendSankhya = useCallback(() => {
-    if (selectedResources.length === 0) return;
-    const fd = new FormData();
-    fd.set("intent", "sendSankhya");
-    fd.set("ids", JSON.stringify(selectedResources));
-    submit(fd, { method: "post" });
-    clearSelection();
-  }, [selectedResources, submit, clearSelection]);
-
-  const doMarkDone = useCallback(() => {
-    if (selectedResources.length === 0) return;
-    const fd = new FormData();
-    fd.set("intent", "markDone");
-    fd.set("ids", JSON.stringify(selectedResources));
-    submit(fd, { method: "post" });
-    clearSelection();
-  }, [selectedResources, submit, clearSelection]);
-
-  // Vínculo manual do Nº Sankhya (modal do pedido). Fecha o modal: o resultado vai no banner
-  // e a lista recarrega com o Nº novo (o activeOrder do modal é um snapshot).
-  const [nunotaInput, setNunotaInput] = useState("");
-  const doSetNunota = useCallback(() => {
-    const nunota = nunotaInput.trim();
-    if (!activeOrder || !nunota) return;
-    const fd = new FormData();
-    fd.set("intent", "setNunota");
-    fd.set("id", activeOrder.id);
-    fd.set("nunota", nunota);
-    submit(fd, { method: "post" });
-    setActiveOrder(null);
-    setNunotaInput("");
-  }, [activeOrder, nunotaInput, submit]);
-
-  const pendingCount = useMemo(
-    () => orders.filter((o) => !sent[o.id]).length,
-    [orders, sent]
+      // Mudou filtro → volta à 1ª página (cursor inválido para a nova busca).
+      next.delete("after");
+      next.delete("before");
+      next.delete("refresh");
+      setSearchParams(next);
+    },
+    [searchParams, setSearchParams]
+  );
+  const goPage = useCallback(
+    (dir) => {
+      const next = new URLSearchParams(searchParams);
+      next.delete("after");
+      next.delete("before");
+      next.delete("refresh");
+      if (dir === "next" && pageInfo.endCursor) next.set("after", pageInfo.endCursor);
+      if (dir === "prev" && pageInfo.startCursor) next.set("before", pageInfo.startCursor);
+      setSearchParams(next);
+    },
+    [searchParams, setSearchParams, pageInfo.endCursor, pageInfo.startCursor]
   );
 
-  // Quantos pendentes já têm Nº Sankhya (visibilidade da sincronização).
-  const nunotaPend = useMemo(() => {
-    const pend = orders.filter((o) => !sent[o.id]);
-    return { com: pend.filter((o) => o.nunota != null).length, total: pend.length };
-  }, [orders, sent]);
+  // Busca: digita livre, aplica ao confirmar (Enter/blur) ou após 500 ms parado.
+  const [q, setQ] = useState(filters.q);
+  useEffect(() => setQ(filters.q), [filters.q]);
+  const qTimer = useRef(null);
+  const commitQ = useCallback(
+    (value) => {
+      clearTimeout(qTimer.current);
+      if ((value || "") !== (filters.q || "")) update({ q: value });
+    },
+    [filters.q, update]
+  );
+  const onQInput = (e) => {
+    const v = e.currentTarget.value;
+    setQ(v);
+    clearTimeout(qTimer.current);
+    qTimer.current = setTimeout(() => commitQ(v), 500);
+  };
+  useEffect(() => () => clearTimeout(qTimer.current), []);
 
-  // Contadores do envio ao Sankhya (sobre os pedidos exibidos).
-  const sankhyaCounts = useMemo(() => {
-    const c = { sent: 0, pending: 0, error: 0, seller: 0, hold: 0, done: 0, naoEnviado: 0 };
-    for (const o of orders) {
-      const st = sankhyaStatus[o.legacyId]?.status;
-      if (st === "sent") c.sent++;
-      else if (st === "error") c.error++;
-      else if (st === "seller") c.seller++;
-      else if (st === "hold") c.hold++;
-      else if (st === "done") c.done++;
-      else if (st === "pending") c.pending++;
-      else c.naoEnviado++; // sem entrada no mapa → nunca ingerido (precisa de backfill)
-    }
-    return c;
-  }, [orders, sankhyaStatus]);
+  // ── Seleção (só da página atual; limpa ao navegar) ──
+  const [selected, setSelected] = useState(() => new Set());
+  useEffect(() => setSelected(new Set()), [location.search]);
+  const allOnPage = rows.length > 0 && rows.every((r) => selected.has(r.id));
+  const someOnPage = !allOnPage && rows.some((r) => selected.has(r.id));
+  const togglePage = (checked) => setSelected(checked ? new Set(rows.map((r) => r.id)) : new Set());
+  const toggleRow = (id, checked) =>
+    setSelected((prev) => {
+      const n = new Set(prev);
+      if (checked) n.add(id);
+      else n.delete(id);
+      return n;
+    });
 
-  // Saúde do envio: pedidos "pendentes" há muito tempo indicam que o envio automático
-  // pode estar travado (cron parado / integração fora). Medimos pela IDADE do job — não
-  // por heartbeat —, então o cron não precisa escrever nada quando está ocioso.
-  // `mounted` gateia a parte dependente de Date.now() (1º render do client == SSR →
-  // evita hydration mismatch); recalcula a cada "Atualizar".
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => { setMounted(true); }, []);
-  const stuck = useMemo(() => {
-    const now = Date.now();
-    let count = 0;
-    let oldestMin = 0;
-    for (const o of orders) {
-      const st = sankhyaStatus[o.legacyId];
-      if (isStuckPending(st, now)) {
-        const ageMin = Math.floor((now - new Date(st.at).getTime()) / 60000);
-        count++;
-        if (ageMin > oldestMin) oldestMin = ageMin;
-      }
-    }
-    return { count, oldestMin };
-  }, [orders, sankhyaStatus]);
-  const showStuck = mounted && stuck.count > 0;
+  // Lotes vão em fatias de BULK_CHUNK (cada request cabe nos limites do Worker).
+  const { bulk, start: startBulk, clear: clearBulk } = useBulk();
+  const bulkRunning = Boolean(bulk && !bulk.finished);
+  const runBulk = useCallback(
+    (intent) => {
+      if (selected.size === 0 || bulkRunning) return;
+      startBulk(intent, [...selected]);
+      setSelected(new Set());
+    },
+    [selected, startBulk, bulkRunning]
+  );
+  const refreshBanco = useCallback(() => post(submit, { intent: "refreshNunotas" }), [submit]);
+  const maintenance = useCallback(
+    (intent, confirmMsg) => {
+      if (confirmMsg && typeof window !== "undefined" && !window.confirm(confirmMsg)) return;
+      post(submit, { intent });
+    },
+    [submit]
+  );
 
-  // Vendedor (por tag) de cada pedido, para exibir na tabela e no modal.
-  const sellerByOrder = useMemo(() => {
-    const map = {};
-    for (const o of orders) {
-      const s = findSellerForTags(o.tags, sellers);
-      if (s) map[o.id] = s.name;
-    }
-    return map;
-  }, [orders, sellers]);
+  // ── Modal de detalhes ──
+  const modalRef = useRef(null);
+  const [activeId, setActiveId] = useState(null);
+  const active = useMemo(() => rows.find((r) => r.id === activeId) || null, [rows, activeId]);
+  const [nunotaInput, setNunotaInput] = useState("");
+  useEffect(() => {
+    if (activeId && modalRef.current?.showOverlay) modalRef.current.showOverlay();
+  }, [activeId]);
+  const closeModal = () => modalRef.current?.hideOverlay?.();
+  const doSetNunota = () => {
+    const nunota = nunotaInput.trim();
+    if (!active || !nunota) return;
+    const fd = new FormData();
+    fd.set("intent", "setNunota");
+    fd.set("id", active.id);
+    fd.set("nunota", nunota);
+    submit(fd, { method: "post" });
+    closeModal();
+  };
 
-  const rows = pagedOrders.map((o, index) => {
-    const sentInfo = sent[o.id];
-    return (
-      <IndexTable.Row id={o.id} key={o.id} position={index} selected={selectedResources.includes(o.id)}>
-        <IndexTable.Cell>
-          <InlineStack gap="150" blockAlign="center">
-            <div
-              role="presentation"
-              onClick={(e) => { e.stopPropagation(); setActiveOrder(o); }}
-              onKeyDown={(e) => e.stopPropagation()}
-            >
-              <Button variant="plain" onClick={() => setActiveOrder(o)}>{o.name}</Button>
-            </div>
-            {o.expired && <Badge tone="critical">Expirado</Badge>}
-          </InlineStack>
-        </IndexTable.Cell>
-        <IndexTable.Cell>
-          {o.nunota != null ? <Text as="span" variant="bodyMd" fontWeight="semibold">{o.nunota}</Text> : "—"}
-        </IndexTable.Cell>
-        <IndexTable.Cell>{o.customer}</IndexTable.Cell>
-        <IndexTable.Cell>{new Date(o.createdAt).toLocaleDateString("pt-BR")}</IndexTable.Cell>
-        <IndexTable.Cell>{o.persoCount}</IndexTable.Cell>
-        <IndexTable.Cell>
-          {o.hasAttributes ? <Badge tone="success">Sim</Badge> : <Badge tone="critical">Não</Badge>}
-        </IndexTable.Cell>
-        <IndexTable.Cell>
-          {o.hasFull ? <Badge tone="critical">Sim</Badge> : <Badge tone="success">Não</Badge>}
-        </IndexTable.Cell>
-        <IndexTable.Cell>
-          <InlineStack gap="100">
-            {o.variacao.map((v) => (
-              <Badge key={v} tone={VARIACAO_TONE[v]}>{v}</Badge>
-            ))}
-          </InlineStack>
-        </IndexTable.Cell>
-        <IndexTable.Cell>
-          {sellerByOrder[o.id] ? <Badge tone="info">{sellerByOrder[o.id]}</Badge> : "—"}
-        </IndexTable.Cell>
-        <IndexTable.Cell>{sankhyaBadge(sankhyaStatus[o.legacyId])}</IndexTable.Cell>
-        <IndexTable.Cell>
-          {sentInfo ? (
-            <InlineStack gap="200" blockAlign="center">
-              <Badge tone="success">Enviado</Badge>
-              {sentInfo.url && <Link url={sentInfo.url} target="_blank">tarefa</Link>}
-            </InlineStack>
-          ) : o.expired ? (
-            <Badge tone="critical">Expirado — não enviar</Badge>
-          ) : (
-            <Badge>Pendente</Badge>
-          )}
-        </IndexTable.Cell>
-        <IndexTable.Cell>
-          {sentInfo?.sentAt ? (
-            <Text as="span" variant="bodySm">
-              {new Date(sentInfo.sentAt).toLocaleString("pt-BR", {
-                day: "2-digit",
-                month: "2-digit",
-                year: "2-digit",
-                hour: "2-digit",
-                minute: "2-digit",
-              })}
-            </Text>
-          ) : (
-            "—"
-          )}
-        </IndexTable.Cell>
-      </IndexTable.Row>
-    );
-  });
+  // ── Sincronização única ──
+  const sync = useSync();
+  const needsSync = (!migracao?.clickupAt || (storeKind === "d1" && !migracao?.scanAt)) && !sync.finished;
+
+  const refreshHref = useMemo(() => {
+    const next = new URLSearchParams(searchParams);
+    next.set("refresh", "1");
+    return `?${next.toString()}`;
+  }, [searchParams]);
+  const refreshing = navigation.state === "loading" && (navigation.location?.search || "").includes("refresh");
+
+  const tabTitle = TAB_LABELS[filters.tab];
+  const hasFilters = Boolean(filters.q || filters.de || filters.ate);
+  const sk = counts?.sankhya;
 
   return (
-    <Page
-      fullWidth
-      title="Pedidos personalizados"
-      subtitle={`Pedidos com a tag "${ORDER_TAG}" — personalização gravada no Sankhya automaticamente; envio ao ClickUp é manual.`}
-      secondaryActions={[
-        {
-          content: isRefreshing ? "Atualizando…" : "Atualizar",
-          loading: isRefreshing,
-          disabled: isRefreshing,
-          onAction: () => navigate("/app/personalizados?refresh=1"),
-        },
-        {
-          content: "Atualizar período…",
-          disabled: isRefreshing,
-          onAction: () => setPeriodOpen(true),
-        },
-        {
-          content: "Cadastro de vendedores",
-          onAction: () => navigate("/app/personalizados/cadastro-de-vendedores"),
-        },
-        {
-          content: isSubmitting && navigation.formData?.get("intent") === "refreshNunotas" ? "Atualizando banco…" : "Atualizar Banco",
-          onAction: doRefreshBanco,
-          loading: isSubmitting && navigation.formData?.get("intent") === "refreshNunotas",
-          disabled: isSubmitting && navigation.formData?.get("intent") === "refreshNunotas",
-        },
-      ]}
-    >
-      <BlockStack gap="500">
-        {!hasToken && (
-          <Banner tone="critical" title="CLICKUP_TOKEN não configurado">
-            <p>Rode <code>wrangler secret put CLICKUP_TOKEN</code> no worker antes de enviar.</p>
-          </Banner>
-        )}
-
-        {refreshError && (
-          <Banner tone="warning" title="Não foi possível atualizar os pedidos agora">
-            <p>
-              Exibindo os dados já salvos (podem estar defasados). Tente de novo, ou use
-              "Atualizar período…" com uma janela menor. Detalhe: {refreshError}
-            </p>
-          </Banner>
-        )}
-
-        {sankhyaError && (
-          <Banner tone="warning" title="Não foi possível puxar o Nº Sankhya">
-            <p>{sankhyaError}</p>
-          </Banner>
-        )}
-
-        {showStuck && (
-          <Banner
-            tone="warning"
-            title={`${stuck.count} pedido(s) aguardando envio ao Sankhya há mais de ${STUCK_MIN} min`}
-            action={{ content: "Ver pedidos", onAction: () => { setSearch(""); setDateFrom(""); setDateTo(""); setFilterAndReset("presos"); } }}
-          >
-            <p>
-              O mais antigo está há ~{stuck.oldestMin} min pendente. Pode ser atraso do Sankhya em
-              receber o pedido, ou o envio automático (cron) travado. Clique em "Ver pedidos" para
-              filtrar exatamente esses e resolvê-los com "Enviar Sankhya" (reprocessar) ou
-              "Concluir" (encerrar sem reenviar).
-            </p>
-          </Banner>
-        )}
-
-        {truncated && (
-          <Banner tone="warning" title={`Exibindo os ${MAX_ORDERS} pedidos mais recentes`}>
-            <p>
-              Há mais pedidos com a tag "{ORDER_TAG}" do que o limite carregado. Os
-              mais antigos não estão listados — aumente <code>MAX_ORDERS</code> se
-              precisar de todo o histórico.
-            </p>
-          </Banner>
-        )}
-
-        {actionData?.success && actionData.action === "send" && (
-          <Banner tone={actionData.errors?.length ? "warning" : "success"} title={`${actionData.created} tarefa(s) criada(s) no ClickUp.`}>
-            <BlockStack gap="100">
-              {actionData.skipped > 0 && <Text as="p" variant="bodySm">{actionData.skipped} ignorado(s) (já enviados ou sem personalização).</Text>}
-              {actionData.skippedExpired > 0 && <Text as="p" variant="bodySm">{actionData.skippedExpired} bloqueado(s) por estarem expirados (não enviados ao ClickUp).</Text>}
-              {actionData.errors?.length > 0 && <Text as="p" variant="bodySm">Erros: {actionData.errors.join(" · ")}</Text>}
-            </BlockStack>
-          </Banner>
-        )}
-        {actionData?.success && actionData.action === "refreshNunotas" && (
-          <Banner tone="success" title={`Banco atualizado: ${actionData.matched} de ${actionData.total} pedido(s) com Nº Sankhya (status inalterado).`} />
-        )}
-        {actionData?.success && actionData.action === "sendSankhya" && (
-          <Banner tone={actionData.errors?.length ? "warning" : "success"} title={`Sankhya: ${actionData.sent} gravado(s), ${actionData.pending} pendente(s)${actionData.sellers ? `, ${actionData.sellers} vendedor(es) ignorado(s)` : ""}.`}>
-            {actionData.errors?.length > 0 && (
-              <BlockStack gap="100">
-                <Text as="p" variant="bodySm">Erros: {actionData.errors.join(" · ")}</Text>
-              </BlockStack>
-            )}
-          </Banner>
-        )}
-        {actionData?.success && actionData.action === "setNunota" && (
-          <Banner
-            tone={actionData.sent > 0 ? "success" : "warning"}
-            title={actionData.sent > 0
-              ? `Nº Sankhya ${actionData.nunota} vinculado e personalização gravada.`
-              : `Nº Sankhya ${actionData.nunota} vinculado, mas a personalização não foi gravada.`}
-          >
-            {actionData.errors?.length > 0 && (
-              <Text as="p" variant="bodySm">Erros: {actionData.errors.join(" · ")}</Text>
-            )}
-            {!actionData.errors?.length && actionData.sent === 0 && (
-              <Text as="p" variant="bodySm">Confira o status Sankhya do pedido (vendedor sem atributos ou sem personalização).</Text>
-            )}
-          </Banner>
-        )}
-        {actionData?.success && actionData.action === "markDone" && (
-          <Banner tone="success" title={`${actionData.done} pedido(s) concluído(s) — removidos do alerta de pendências.`} />
-        )}
-        {actionData?.error && (
-          <Banner tone="critical" title="Erro"><p>{actionData.error}</p></Banner>
-        )}
-
-        {orders.length === 0 ? (
-          <Card>
-            <EmptyState heading="Nenhum pedido personalizado" image="https://cdn.shopify.com/shopifycloud/web/assets/v1/vite/client/en/assets/personalized-empty-state-Bu4xlcHV0rQu.svg">
-              <p>Pedidos com a tag "{ORDER_TAG}" aparecerão aqui.</p>
-            </EmptyState>
-          </Card>
-        ) : (
-          <Card padding="0">
-            <Box padding="300" borderBlockEndWidth="025" borderColor="border">
-              <BlockStack gap="300">
-                <InlineStack align="space-between" blockAlign="center">
-                  <InlineStack gap="300" blockAlign="center">
-                    <ButtonGroup variant="segmented">
-                      <Button pressed={filter === "todos"} onClick={() => setFilterAndReset("todos")}>Todos</Button>
-                      <Button pressed={filter === "enviados"} onClick={() => setFilterAndReset("enviados")}>Enviados</Button>
-                      <Button pressed={filter === "pendentes"} onClick={() => setFilterAndReset("pendentes")}>Pendentes</Button>
-                      <Button pressed={filter === "semAtributos"} onClick={() => setFilterAndReset("semAtributos")}>Sem atributos</Button>
-                    </ButtonGroup>
-                    <BlockStack gap="050">
-                      <Text as="span" variant="bodySm" tone="subdued">
-                        {filteredOrders.length} pedido(s) · Sankhya: {sankhyaCounts.sent} gravados · {sankhyaCounts.pending} pendentes · {sankhyaCounts.error} erros{sankhyaCounts.naoEnviado ? ` · ${sankhyaCounts.naoEnviado} não enviados` : ""}{sankhyaCounts.seller ? ` · ${sankhyaCounts.seller} vendedor(es)` : ""}{sankhyaCounts.hold ? ` · ${sankhyaCounts.hold} em análise` : ""}{sankhyaCounts.done ? ` · ${sankhyaCounts.done} concluído(s)` : ""} · ClickUp: {pendingCount} pendente(s){selectedResources.length > 0 ? ` · ${selectedResources.length} selecionado(s)` : ""}
-                      </Text>
-                      {mounted && fetchedAt && (
-                        <Text as="span" variant="bodySm" tone="subdued">
-                          Última atualização: {new Date(fetchedAt).toLocaleString("pt-BR")}
-                          {lastWindow?.since ? ` · janela ${lastWindow.since} → ${lastWindow.until}` : ""}
-                        </Text>
-                      )}
-                    </BlockStack>
-                  </InlineStack>
-                  <InlineStack gap="200">
-                    <Button
-                      variant="primary"
-                      disabled={selectedResources.length === 0}
-                      loading={isSubmitting && navigation.formData?.get("intent") === "send"}
-                      onClick={() => doSend(false)}
-                    >
-                      Enviar para ClickUp
-                    </Button>
-                    <Button
-                      disabled={selectedResources.length === 0}
-                      loading={isSubmitting && navigation.formData?.get("intent") === "sendSankhya"}
-                      onClick={doSendSankhya}
-                    >
-                      Enviar Sankhya
-                    </Button>
-                    <Button
-                      tone="success"
-                      disabled={selectedResources.length === 0}
-                      loading={isSubmitting && navigation.formData?.get("intent") === "markDone"}
-                      onClick={doMarkDone}
-                    >
-                      Concluir
-                    </Button>
-                    <Button
-                      tone="critical"
-                      disabled={selectedResources.length === 0}
-                      loading={isSubmitting && navigation.formData?.get("intent") === "sendForce"}
-                      onClick={() => doSend(true)}
-                    >
-                      Forçar reenvio
-                    </Button>
-                  </InlineStack>
-                </InlineStack>
-                <InlineStack gap="200" blockAlign="end" wrap>
-                  <div style={{ flexGrow: 1, minWidth: "240px" }}>
-                    <TextField
-                      label="Buscar"
-                      labelHidden
-                      placeholder="Buscar por pedido, cliente, nome, SKU, vendedor, nota…"
-                      value={search}
-                      onChange={(v) => { setSearch(v); setPage(0); }}
-                      autoComplete="off"
-                      clearButton
-                      onClearButtonClick={() => { setSearch(""); setPage(0); }}
-                    />
-                  </div>
-                  <TextField
-                    label="De"
-                    labelInline
-                    type="date"
-                    value={dateFrom}
-                    onChange={(v) => { setDateFrom(v); setPage(0); }}
-                    autoComplete="off"
-                  />
-                  <TextField
-                    label="Até"
-                    labelInline
-                    type="date"
-                    value={dateTo}
-                    onChange={(v) => { setDateTo(v); setPage(0); }}
-                    autoComplete="off"
-                  />
-                  {(search || dateFrom || dateTo) && (
-                    <Button
-                      variant="plain"
-                      onClick={() => { setSearch(""); setDateFrom(""); setDateTo(""); setPage(0); }}
-                    >
-                      Limpar
-                    </Button>
-                  )}
-                </InlineStack>
-              </BlockStack>
-            </Box>
-            <IndexTable
-              resourceName={{ singular: "pedido", plural: "pedidos" }}
-              itemCount={pagedOrders.length}
-              selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
-              onSelectionChange={handleSelectionChange}
-              headings={[
-                { title: "Pedido" },
-                { title: "Nº Sankhya" },
-                { title: "Cliente" },
-                { title: "Data" },
-                { title: "Persos" },
-                { title: "Atributos" },
-                { title: "Envio Imediato" },
-                { title: "Variação" },
-                { title: "Vendedor" },
-                { title: "Sankhya" },
-                { title: "ClickUp" },
-                { title: "Enviado em" },
-              ]}
-            >
-              {rows}
-            </IndexTable>
-            <Box padding="300" borderBlockStartWidth="025" borderColor="border">
-              <InlineStack align="space-between" blockAlign="center">
-                <Select
-                  label="Itens por página"
-                  labelInline
-                  options={["10", "25", "50", "100", "200"].map((v) => ({ label: v, value: v }))}
-                  value={pageSize}
-                  onChange={(v) => { setPageSize(v); setPage(0); }}
-                />
-                <Pagination
-                  hasPrevious={safePage > 0}
-                  onPrevious={() => setPage(safePage - 1)}
-                  hasNext={safePage < totalPages - 1}
-                  onNext={() => setPage(safePage + 1)}
-                  label={`Página ${safePage + 1} de ${totalPages}`}
-                />
-              </InlineStack>
-            </Box>
-          </Card>
-        )}
-        <Box paddingBlockEnd="800" />
-      </BlockStack>
-
-      {activeOrder && (
-        <Modal
-          open
-          onClose={() => { setActiveOrder(null); setNunotaInput(""); }}
-          title={`Pedido ${activeOrder.name}`}
-          size="large"
-        >
-          <Modal.Section>
-            <BlockStack gap="400">
-              <InlineStack gap="200" blockAlign="center" wrap>
-                <Text as="span" variant="bodyMd" fontWeight="bold">{activeOrder.customer || "—"}</Text>
-                <Text as="span" tone="subdued">{new Date(activeOrder.createdAt).toLocaleDateString("pt-BR")}</Text>
-                {activeOrder.nunota != null && (
-                  <Badge tone="info">
-                    {`Nº Sankhya: ${activeOrder.nunota}${sankhyaStatus[activeOrder.legacyId]?.nunotaManual ? " (manual)" : ""}`}
-                  </Badge>
-                )}
-                {activeOrder.variacao.map((v) => <Badge key={v} tone={VARIACAO_TONE[v]}>{v}</Badge>)}
-                {sellerByOrder[activeOrder.id] && <Badge tone="info">Vendedor: {sellerByOrder[activeOrder.id]}</Badge>}
-                {activeOrder.hasFull && <Badge tone="critical">Envio Imediato (FULL)</Badge>}
-                {activeOrder.expired && <Badge tone="critical">Expirado</Badge>}
-                {sent[activeOrder.id]
-                  ? <Badge tone="success">ClickUp: enviado</Badge>
-                  : activeOrder.expired
-                    ? <Badge tone="critical">ClickUp: bloqueado (expirado)</Badge>
-                    : <Badge>ClickUp: pendente</Badge>}
-                {sent[activeOrder.id]?.url && <Link url={sent[activeOrder.id].url} target="_blank">tarefa no ClickUp</Link>}
-                {(() => {
-                  const st = sankhyaStatus[activeOrder.legacyId];
-                  const label = !st ? "Sankhya: não enviado"
-                    : st.status === "sent" ? `Sankhya: gravado${st.written ? ` (${st.written} item(ns))` : ""}`
-                    : st.status === "seller" ? "Sankhya: vendedor (não enviado)"
-                    : st.status === "error" ? "Sankhya: erro"
-                    : "Sankhya: pendente";
-                  const tone = !st ? undefined
-                    : st.status === "sent" ? "success"
-                    : st.status === "error" ? "critical"
-                    : st.status === "seller" ? "info"
-                    : "attention";
-                  return <Badge tone={tone}>{label}</Badge>;
-                })()}
-              </InlineStack>
-
-              {sankhyaStatus[activeOrder.legacyId]?.reason && (
-                <Text as="p" variant="bodySm" tone="subdued">
-                  Sankhya: {sankhyaStatus[activeOrder.legacyId].reason}
-                </Text>
-              )}
-
-              {sankhyaStatus[activeOrder.legacyId]?.status !== "sent" && (
-                <Box padding="300" background="bg-surface-secondary" borderRadius="200">
-                  <BlockStack gap="200">
-                    <Text as="p" variant="bodySm" fontWeight="bold">
-                      {activeOrder.nunota == null ? "Vincular Nº Sankhya manualmente" : "Corrigir Nº Sankhya"}
-                    </Text>
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      Para pedido lançado no Sankhya sem o vínculo com a Shopify. Informe o Nro Único
-                      (NUNOTA), não o nº da nota fiscal. O número é conferido no Sankhya e a
-                      personalização é gravada em seguida.
-                    </Text>
-                    <InlineStack gap="200" blockAlign="end" wrap={false}>
-                      <div style={{ flex: 1, maxWidth: 240 }}>
-                        <TextField
-                          label="Nº Sankhya (NUNOTA)"
-                          labelHidden
-                          placeholder="Ex.: 1619183"
-                          inputMode="numeric"
-                          value={nunotaInput}
-                          onChange={(v) => setNunotaInput(v.replace(/\D/g, ""))}
-                          autoComplete="off"
-                        />
-                      </div>
-                      <Button
-                        onClick={doSetNunota}
-                        disabled={!nunotaInput.trim() || isSubmitting}
-                      >
-                        Vincular e gravar
-                      </Button>
-                    </InlineStack>
-                  </BlockStack>
-                </Box>
-              )}
-
-              {activeOrder.note && (
-                <Box padding="300" background="bg-surface-secondary" borderRadius="200">
-                  <BlockStack gap="100">
-                    <Text as="p" variant="bodySm" fontWeight="bold">Nota do pedido</Text>
-                    <Text as="p" variant="bodySm">{activeOrder.note}</Text>
-                  </BlockStack>
-                </Box>
-              )}
-
-              <Divider />
-
-              {activeOrder.personalizations.length === 0 ? (
-                <Text as="p" tone="subdued">Este pedido tem o PE1198 mas sem os atributos do nosso modal (provável inclusão por vendedor externo).</Text>
-              ) : (
-                activeOrder.personalizations.map((p, i) => (
-                  <Box key={i} padding="300" borderWidth="025" borderColor="border" borderRadius="200">
-                    <InlineStack gap="400" blockAlign="start" wrap={false}>
-                      {p.arte && (
-                        <Link url={p.arte} target="_blank">
-                          <Thumbnail source={p.arte} alt="Arte de referência" size="large" />
-                        </Link>
-                      )}
-                      <BlockStack gap="100">
-                        <InlineStack gap="200" blockAlign="center" wrap>
-                          <Text as="span" variant="bodyMd" fontWeight="bold">{p.sku || "—"}</Text>
-                          {p.url && <Link url={p.url} target="_blank">ver produto</Link>}
-                        </InlineStack>
-                        {p.title && <Text as="span" variant="bodySm" tone="subdued">{p.title}</Text>}
-                        {p.tipo && <Text as="span" variant="bodySm"><strong>Tipo:</strong> {p.tipo}</Text>}
-                        <Text as="span" variant="bodySm"><strong>Nome:</strong> {p.nome}</Text>
-                        <Text as="span" variant="bodySm"><strong>Local:</strong> {p.local}</Text>
-                        <Text as="span" variant="bodySm"><strong>Posição:</strong> {p.posicao}</Text>
-                        {p.arte && <Link url={p.arte} target="_blank">Abrir arte em tamanho real</Link>}
-                      </BlockStack>
-                    </InlineStack>
-                  </Box>
-                ))
-              )}
-            </BlockStack>
-          </Modal.Section>
-        </Modal>
-      )}
-
-      <Modal
-        open={periodOpen}
-        onClose={() => setPeriodOpen(false)}
-        title="Atualizar por período"
-        primaryAction={{
-          content: "Atualizar",
-          disabled: !periodSince || isRefreshing,
-          onAction: doRefreshPeriod,
-        }}
-        secondaryActions={[{ content: "Cancelar", onAction: () => setPeriodOpen(false) }]}
+    <s-page heading="Pedidos personalizados" inlineSize="large">
+      <s-button
+        slot="secondary-actions"
+        onClick={() => setSearchParams(new URLSearchParams(refreshHref.slice(1)))}
+        loading={refreshing || undefined}
+        disabled={refreshing || undefined}
       >
-        <Modal.Section>
-          <BlockStack gap="300">
-            <Text as="p" variant="bodySm" tone="subdued">
-              Busca os pedidos personalizados criados no período (por data de criação) e
-              mescla no histórico já carregado — não substitui os antigos. Use quando ficou
-              alguns dias sem atualizar (ex.: início 4 dias atrás → hoje).
-            </Text>
-            <InlineStack gap="300">
-              <TextField
-                label="De"
-                type="date"
-                value={periodSince}
-                onChange={setPeriodSince}
-                autoComplete="off"
-              />
-              <TextField
-                label="Até (vazio = hoje)"
-                type="date"
-                value={periodUntil}
-                onChange={setPeriodUntil}
-                autoComplete="off"
-              />
-            </InlineStack>
-          </BlockStack>
-        </Modal.Section>
-      </Modal>
-    </Page>
+        Atualizar
+      </s-button>
+      <s-button
+        slot="secondary-actions"
+        onClick={refreshBanco}
+        loading={busyIntent === "refreshNunotas" || undefined}
+        disabled={busyIntent === "refreshNunotas" || undefined}
+      >
+        Atualizar Banco
+      </s-button>
+      <s-button slot="secondary-actions" href="/app/personalizados/cadastro-de-vendedores">
+        Cadastro de vendedores
+      </s-button>
+
+      <s-stack gap="base">
+        <s-paragraph color="subdued">
+          Pedidos com a personalização (SKU PE1198 / tag "{ORDER_TAG}") — gravada no Sankhya
+          automaticamente; o envio ao ClickUp é manual.
+        </s-paragraph>
+
+        {!hasToken && (
+          <s-banner tone="critical" heading="CLICKUP_TOKEN não configurado">
+            Rode wrangler secret put CLICKUP_TOKEN no worker antes de enviar.
+          </s-banner>
+        )}
+
+        {needsSync && (
+          <s-banner tone="warning" heading="Sincronize os dados antigos com o novo sistema (uma vez)">
+            <s-stack gap="small">
+              <s-paragraph>
+                A dashboard agora marca os envios ao ClickUp no próprio pedido e guarda o status do
+                Sankhya num banco próprio. Para as abas e contadores ficarem corretos, copie os
+                envios já feitos e confira os pedidos sem atributos. Os registros antigos são
+                mantidos intactos. Leva alguns segundos.
+              </s-paragraph>
+              {sync.running ? (
+                <s-paragraph>
+                  {sync.phase === "clickup"
+                    ? `Copiando envios ao ClickUp… ${sync.done} de ${sync.total || "?"} pedido(s).`
+                    : `Conferindo pedidos com personalização… ${sync.scanned} verificado(s).`}
+                </s-paragraph>
+              ) : (
+                <s-stack direction="inline" gap="small">
+                  <s-button variant="primary" onClick={sync.start}>Sincronizar agora</s-button>
+                </s-stack>
+              )}
+            </s-stack>
+          </s-banner>
+        )}
+        {sync.finished && (
+          <s-banner
+            tone={sync.errors.length ? "warning" : "success"}
+            heading={`Sincronização concluída: ${sync.done} de ${sync.total} envio(s) copiados · ${sync.scanned} pedido(s) conferido(s).`}
+          >
+            {sync.errors.length > 0 && <s-paragraph>Erros: {sync.errors.join(" · ")}</s-paragraph>}
+          </s-banner>
+        )}
+        {storeKind !== "d1" && (
+          <s-banner tone="info" heading="Banco da dashboard (D1) não configurado">
+            Usando o modo anterior (KV) para o status do Sankhya — funciona, mas o custo cresce com o
+            histórico. Configure o binding PERSO_DB no worker.
+          </s-banner>
+        )}
+        <BulkResult bulk={bulk} onDismiss={clearBulk} />
+
+        {error && (
+          <s-banner tone="critical" heading="Não foi possível carregar os pedidos">
+            {error} — tente "Atualizar" em instantes.
+          </s-banner>
+        )}
+        {sankhyaError && (
+          <s-banner tone="warning" heading="Não foi possível puxar o Nº Sankhya">{sankhyaError}</s-banner>
+        )}
+
+        {stuck.count > 0 && filters.tab !== "presos" && (
+          <s-banner tone="warning" heading={`${stuck.count} pedido(s) aguardando envio ao Sankhya há mais de ${STUCK_MIN} min`}>
+            <s-stack gap="small">
+              <s-paragraph>
+                O mais antigo está há ~{stuck.oldestMin} min pendente. Pode ser atraso do Sankhya em
+                receber o pedido, ou o envio automático travado. Resolva com "Enviar Sankhya"
+                (reprocessar) ou "Concluir" (encerrar sem reenviar).
+              </s-paragraph>
+              <s-stack direction="inline">
+                <s-button onClick={() => setSearchParams(new URLSearchParams({ tab: "presos" }))}>Ver pedidos</s-button>
+              </s-stack>
+            </s-stack>
+          </s-banner>
+        )}
+
+        {!bulk && !sync.running && <ActionResult data={actionData} />}
+
+        <s-section padding="none" accessibilityLabel="Pedidos personalizados">
+          <s-box padding="base">
+            <s-stack gap="small">
+              <s-stack direction="inline" gap="base" alignItems="center" justifyContent="space-between">
+                <s-button-group gap="none" accessibilityLabel="Visões">
+                  {TABS.map((t) => (
+                    <s-button
+                      key={t}
+                      slot="secondary-actions"
+                      variant="secondary"
+                      icon={filters.tab === t ? "check" : undefined}
+                      aria-pressed={filters.tab === t ? "true" : "false"}
+                      onClick={() => update({ tab: t === "todos" ? null : t })}
+                    >
+                      {TAB_LABELS[t]}
+                    </s-button>
+                  ))}
+                </s-button-group>
+                {counts && (
+                  <s-text color="subdued">
+                    {page.total} pedido(s){filters.tab !== "todos" || hasFilters ? ` em "${tabTitle}"${hasFilters ? " (filtrado)" : ""}` : ""}
+                    {" · "}ClickUp: {counts.clickupPendentes} pendente(s)
+                  </s-text>
+                )}
+              </s-stack>
+              {sk && (
+                <s-text color="subdued">
+                  Sankhya: {sk.sent} gravados · {sk.pending} pendentes · {sk.error} erros
+                  {sk.naoEnviado ? ` · ${sk.naoEnviado} não enviados` : ""}
+                  {sk.seller ? ` · ${sk.seller} vendedor(es)` : ""}
+                  {sk.hold ? ` · ${sk.hold} em análise` : ""}
+                  {sk.done ? ` · ${sk.done} concluído(s)` : ""}
+                </s-text>
+              )}
+            </s-stack>
+          </s-box>
+
+          <s-table
+            paginate
+            loading={loadingList || undefined}
+            hasPreviousPage={pageInfo.hasPreviousPage || undefined}
+            hasNextPage={pageInfo.hasNextPage || undefined}
+            onPreviousPage={() => goPage("prev")}
+            onNextPage={() => goPage("next")}
+          >
+            {selected.size > 0 ? (
+              <s-box slot="filters" padding="small" background="strong">
+                <s-stack direction="inline" gap="base" alignItems="center" justifyContent="space-between">
+                  <s-text>{selected.size} selecionado(s)</s-text>
+                  <s-stack direction="inline" gap="small">
+                    <s-button variant="primary" onClick={() => runBulk("send")} loading={busyIntent === "send" || undefined}>
+                      Enviar para ClickUp
+                    </s-button>
+                    <s-button onClick={() => runBulk("sendSankhya")} loading={busyIntent === "sendSankhya" || undefined}>
+                      Enviar Sankhya
+                    </s-button>
+                    <s-button onClick={() => runBulk("markDone")} loading={busyIntent === "markDone" || undefined}>
+                      Concluir
+                    </s-button>
+                    <s-button tone="critical" onClick={() => runBulk("sendForce")} loading={busyIntent === "sendForce" || undefined}>
+                      Forçar reenvio
+                    </s-button>
+                    <s-button variant="tertiary" onClick={() => setSelected(new Set())}>Limpar seleção</s-button>
+                  </s-stack>
+                </s-stack>
+              </s-box>
+            ) : D1_TABS.includes(filters.tab) ? (
+              <s-box slot="filters" padding="small">
+                <s-text color="subdued">
+                  {filters.tab === "presos"
+                    ? `Pedidos pendentes no Sankhya há mais de ${STUCK_MIN} min (inclui os que o envio automático parou de tentar). `
+                    : "Pedidos com o PE1198 sem os atributos do modal. "}
+                  Nesta aba a busca e o período não se aplicam.
+                </s-text>
+              </s-box>
+            ) : (
+              <s-grid slot="filters" gap="small-200" gridTemplateColumns="1fr auto auto auto" alignItems="end">
+                <s-search-field
+                  label="Buscar"
+                  labelAccessibilityVisibility="exclusive"
+                  placeholder="Pedido, cliente, Nº Sankhya, vendedor, SKU…"
+                  value={q}
+                  onInput={onQInput}
+                  onChange={(e) => commitQ(e.currentTarget.value)}
+                />
+                <s-date-field label="De" labelAccessibilityVisibility="exclusive" value={filters.de} onChange={(e) => update({ de: e.currentTarget.value })} />
+                <s-date-field label="Até" labelAccessibilityVisibility="exclusive" value={filters.ate} onChange={(e) => update({ ate: e.currentTarget.value })} />
+                {hasFilters ? (
+                  <s-button variant="tertiary" onClick={() => update({ q: null, de: null, ate: null })}>Limpar</s-button>
+                ) : (
+                  <span />
+                )}
+              </s-grid>
+            )}
+
+            <s-table-header-row>
+              <s-table-header listSlot="primary">
+                <s-stack direction="inline" gap="small" alignItems="center">
+                  <s-checkbox
+                    accessibilityLabel="Selecionar a página"
+                    checked={allOnPage || undefined}
+                    indeterminate={someOnPage || undefined}
+                    onChange={(e) => togglePage(e.currentTarget.checked)}
+                  />
+                  <s-text>Pedido</s-text>
+                </s-stack>
+              </s-table-header>
+              <s-table-header listSlot="labeled">Nº Sankhya</s-table-header>
+              <s-table-header listSlot="secondary">Cliente</s-table-header>
+              <s-table-header listSlot="labeled">Data</s-table-header>
+              <s-table-header listSlot="labeled" format="numeric">Persos</s-table-header>
+              <s-table-header listSlot="labeled">Atributos</s-table-header>
+              <s-table-header listSlot="labeled">Envio Imediato</s-table-header>
+              <s-table-header listSlot="labeled">Variação</s-table-header>
+              <s-table-header listSlot="labeled">Vendedor</s-table-header>
+              <s-table-header listSlot="inline">Sankhya</s-table-header>
+              <s-table-header listSlot="inline">ClickUp</s-table-header>
+              <s-table-header listSlot="labeled">Enviado em</s-table-header>
+            </s-table-header-row>
+            <s-table-body>
+              {rows.map((r) => (
+                <s-table-row key={r.id} clickDelegate={`sel-${r.legacyId}`}>
+                  <s-table-cell>
+                    <s-stack direction="inline" gap="small" alignItems="center">
+                      <s-checkbox
+                        id={`sel-${r.legacyId}`}
+                        accessibilityLabel={`Selecionar ${r.name}`}
+                        checked={selected.has(r.id) || undefined}
+                        onChange={(e) => toggleRow(r.id, e.currentTarget.checked)}
+                      />
+                      <s-button
+                        variant="tertiary"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setNunotaInput("");
+                          setActiveId(r.id);
+                          if (activeId === r.id) modalRef.current?.showOverlay?.();
+                        }}
+                      >
+                        {r.name}
+                      </s-button>
+                      {r.expired && <s-badge tone="critical">Expirado</s-badge>}
+                    </s-stack>
+                  </s-table-cell>
+                  <s-table-cell>{r.nunota != null ? <s-text type="strong">{r.nunota}</s-text> : "—"}</s-table-cell>
+                  <s-table-cell>{r.customer || "—"}</s-table-cell>
+                  <s-table-cell>{fmtDate(r.createdAt)}</s-table-cell>
+                  <s-table-cell>{r.persoCount}</s-table-cell>
+                  <s-table-cell>
+                    {r.hasAttributes ? <s-badge tone="success">Sim</s-badge> : <s-badge tone="critical">Não</s-badge>}
+                  </s-table-cell>
+                  <s-table-cell>
+                    {r.hasFull ? <s-badge tone="critical">Sim</s-badge> : <s-badge tone="success">Não</s-badge>}
+                  </s-table-cell>
+                  <s-table-cell>
+                    <s-stack direction="inline" gap="small-300">
+                      {r.variacao.map((v) => (
+                        <s-badge key={v} tone={VARIACAO_TONE[v]}>{v}</s-badge>
+                      ))}
+                    </s-stack>
+                  </s-table-cell>
+                  <s-table-cell>{r.seller ? <s-badge tone="info">{r.seller}</s-badge> : "—"}</s-table-cell>
+                  <s-table-cell><SankhyaBadge st={r.sankhya} /></s-table-cell>
+                  <s-table-cell>
+                    <s-stack direction="inline" gap="small" alignItems="center">
+                      <ClickupBadge row={r} />
+                      {r.clickup?.url && (
+                        <s-link href={r.clickup.url} target="_blank">tarefa</s-link>
+                      )}
+                    </s-stack>
+                  </s-table-cell>
+                  <s-table-cell>{r.clickup?.sentAt ? fmtDateTime(r.clickup.sentAt) : "—"}</s-table-cell>
+                </s-table-row>
+              ))}
+            </s-table-body>
+          </s-table>
+
+          {rows.length === 0 && !error && (
+            <s-box padding="large">
+              <s-paragraph color="subdued">
+                {hasFilters || filters.tab !== "todos"
+                  ? "Nenhum pedido nesta visão/filtro."
+                  : `Nenhum pedido personalizado ainda. Pedidos com a tag "${ORDER_TAG}" aparecerão aqui.`}
+              </s-paragraph>
+            </s-box>
+          )}
+
+          <s-box padding="base">
+            <s-stack direction="inline" gap="base" alignItems="center" justifyContent="space-between">
+              <s-select
+                label="Itens por página"
+                value={String(filters.size)}
+                onChange={(e) => update({ size: e.currentTarget.value === String(DEFAULT_PAGE_SIZE) ? null : e.currentTarget.value })}
+              >
+                {PAGE_SIZES.map((n) => (
+                  <s-option key={n} value={String(n)} selected={n === filters.size || undefined}>
+                    {n}
+                  </s-option>
+                ))}
+              </s-select>
+              <s-text color="subdued">
+                {rows.length} de {page?.total ?? 0} nesta visão
+              </s-text>
+            </s-stack>
+          </s-box>
+        </s-section>
+
+        <s-section heading="Manutenção" accessibilityLabel="Manutenção da dashboard">
+          <s-stack gap="small">
+            <s-paragraph color="subdued">
+              Uso raro. "Recalcular contadores" corrige os números do resumo do Sankhya. As
+              exportações regeram os registros no formato antigo, para voltar à versão anterior
+              do app com os dados atuais (nada é apagado).
+            </s-paragraph>
+            <s-stack direction="inline" gap="small">
+              <s-button onClick={() => maintenance("recountCounters")} disabled={storeKind !== "d1" || undefined}>
+                Recalcular contadores
+              </s-button>
+              <s-button
+                onClick={() => maintenance("exportKv", "Regerar o status do Sankhya no formato antigo (KV)? Use só para voltar à versão anterior do app.")}
+                disabled={storeKind !== "d1" || undefined}
+              >
+                Exportar status do Sankhya (formato antigo)
+              </s-button>
+              <s-button onClick={() => maintenance("exportClickupLegacy", "Regerar o registro antigo de envios ao ClickUp a partir dos pedidos? Use só para voltar à versão anterior do app.")}>
+                Exportar envios ao ClickUp (formato antigo)
+              </s-button>
+            </s-stack>
+          </s-stack>
+        </s-section>
+      </s-stack>
+
+      <s-modal
+        id="perso-detalhe"
+        ref={modalRef}
+        heading={active ? `Pedido ${active.name}` : "Pedido"}
+        size="large"
+        onHide={() => {
+          setActiveId(null);
+          setNunotaInput("");
+        }}
+      >
+        {active && (
+          <s-stack gap="base">
+            <s-stack direction="inline" gap="small" alignItems="center">
+              <s-text type="strong">{active.customer || "—"}</s-text>
+              <s-text color="subdued">{fmtDate(active.createdAt)}</s-text>
+              {active.nunota != null && (
+                <s-badge tone="info">{`Nº Sankhya: ${active.nunota}${active.sankhya?.nunotaManual ? " (manual)" : ""}`}</s-badge>
+              )}
+              {active.variacao.map((v) => (
+                <s-badge key={v} tone={VARIACAO_TONE[v]}>{v}</s-badge>
+              ))}
+              {active.seller && <s-badge tone="info">Vendedor: {active.seller}</s-badge>}
+              {active.hasFull && <s-badge tone="critical">Envio Imediato (FULL)</s-badge>}
+              {active.expired && <s-badge tone="critical">Expirado</s-badge>}
+              {active.clickup ? (
+                <s-badge tone="success">ClickUp: enviado</s-badge>
+              ) : active.expired ? (
+                <s-badge tone="critical">ClickUp: bloqueado (expirado)</s-badge>
+              ) : (
+                <s-badge tone="neutral">ClickUp: pendente</s-badge>
+              )}
+              {active.clickup?.url && <s-link href={active.clickup.url} target="_blank">tarefa no ClickUp</s-link>}
+              <SankhyaBadge st={active.sankhya} />
+            </s-stack>
+
+            {active.sankhya?.reason && <s-paragraph color="subdued">Sankhya: {active.sankhya.reason}</s-paragraph>}
+
+            {active.sankhya?.status !== "sent" && (
+              <s-box padding="base" background="subdued" borderRadius="base">
+                <s-stack gap="small">
+                  <s-text type="strong">{active.nunota == null ? "Vincular Nº Sankhya manualmente" : "Corrigir Nº Sankhya"}</s-text>
+                  <s-paragraph color="subdued">
+                    Para pedido lançado no Sankhya sem o vínculo com a Shopify. Informe o Nro Único
+                    (NUNOTA), não o nº da nota fiscal. O número é conferido no Sankhya e a
+                    personalização é gravada em seguida.
+                  </s-paragraph>
+                  <s-grid gridTemplateColumns="240px auto" gap="small" alignItems="end">
+                    <s-text-field
+                      label="Nº Sankhya (NUNOTA)"
+                      labelAccessibilityVisibility="exclusive"
+                      placeholder="Ex.: 1619183"
+                      value={nunotaInput}
+                      onInput={(e) => setNunotaInput(e.currentTarget.value.replace(/\D/g, ""))}
+                    />
+                    <s-button onClick={doSetNunota} disabled={!nunotaInput.trim() || Boolean(busyIntent) || undefined}>
+                      Vincular e gravar
+                    </s-button>
+                  </s-grid>
+                </s-stack>
+              </s-box>
+            )}
+
+            {active.note && (
+              <s-box padding="base" background="subdued" borderRadius="base">
+                <s-stack gap="small-300">
+                  <s-text type="strong">Nota do pedido</s-text>
+                  <s-paragraph>{active.note}</s-paragraph>
+                </s-stack>
+              </s-box>
+            )}
+
+            <s-divider />
+
+            {active.personalizations.length === 0 ? (
+              <s-paragraph color="subdued">
+                Este pedido tem o PE1198 mas sem os atributos do nosso modal (provável inclusão por vendedor externo).
+              </s-paragraph>
+            ) : (
+              active.personalizations.map((p, i) => (
+                <s-box key={i} padding="base" border="base" borderRadius="base">
+                  <s-stack direction="inline" gap="base" alignItems="start">
+                    {p.arte && (
+                      <s-link href={p.arte} target="_blank">
+                        <s-thumbnail src={p.arte} alt="Arte de referência" size="large" />
+                      </s-link>
+                    )}
+                    <s-stack gap="small-300">
+                      <s-stack direction="inline" gap="small" alignItems="center">
+                        <s-text type="strong">{p.sku || "—"}</s-text>
+                        {p.url && <s-link href={p.url} target="_blank">ver produto</s-link>}
+                      </s-stack>
+                      {p.title && <s-text color="subdued">{p.title}</s-text>}
+                      {p.tipo && <s-text><s-text type="strong">Tipo:</s-text> {p.tipo}</s-text>}
+                      <s-text><s-text type="strong">Nome:</s-text> {p.nome}</s-text>
+                      <s-text><s-text type="strong">Local:</s-text> {p.local}</s-text>
+                      <s-text><s-text type="strong">Posição:</s-text> {p.posicao}</s-text>
+                      {p.arte && <s-link href={p.arte} target="_blank">Abrir arte em tamanho real</s-link>}
+                    </s-stack>
+                  </s-stack>
+                </s-box>
+              ))
+            )}
+          </s-stack>
+        )}
+        <s-button slot="secondary-actions" onClick={closeModal}>Fechar</s-button>
+      </s-modal>
+    </s-page>
+  );
+}
+
+// Banner com o resultado da última ação (mesmos textos da versão anterior).
+function ActionResult({ data }) {
+  if (!data) return null;
+  if (data.error) return <s-banner tone="critical" heading="Erro">{data.error}</s-banner>;
+  if (!data.success) return null;
+  if (data.action === "send") {
+    return (
+      <s-banner tone={data.errors?.length ? "warning" : "success"} heading={`${data.created} tarefa(s) criada(s) no ClickUp.`}>
+        <s-stack gap="small-300">
+          {data.skipped > 0 && <s-paragraph>{data.skipped} ignorado(s) (já enviados ou sem personalização).</s-paragraph>}
+          {data.skippedExpired > 0 && <s-paragraph>{data.skippedExpired} bloqueado(s) por estarem expirados (não enviados ao ClickUp).</s-paragraph>}
+          {data.errors?.length > 0 && <s-paragraph>Erros: {data.errors.join(" · ")}</s-paragraph>}
+        </s-stack>
+      </s-banner>
+    );
+  }
+  if (data.action === "refreshNunotas") {
+    return (
+      <s-banner
+        tone="success"
+        heading={`Banco atualizado: ${data.matched} de ${data.total} pedido(s) sem Nº consultado(s) ganharam Nº Sankhya (status inalterado).`}
+      >
+        {data.more && <s-paragraph>Ainda há pedidos sem Nº — clique em "Atualizar Banco" de novo para o próximo lote.</s-paragraph>}
+      </s-banner>
+    );
+  }
+  if (data.action === "maintenance") {
+    return <s-banner tone="success" heading={data.message} />;
+  }
+  if (data.action === "sendSankhya") {
+    return (
+      <s-banner
+        tone={data.errors?.length ? "warning" : "success"}
+        heading={`Sankhya: ${data.sent} gravado(s), ${data.pending} pendente(s)${data.sellers ? `, ${data.sellers} vendedor(es) ignorado(s)` : ""}.`}
+      >
+        {data.errors?.length > 0 && <s-paragraph>Erros: {data.errors.join(" · ")}</s-paragraph>}
+      </s-banner>
+    );
+  }
+  if (data.action === "setNunota") {
+    return (
+      <s-banner
+        tone={data.sent > 0 ? "success" : "warning"}
+        heading={data.sent > 0
+          ? `Nº Sankhya ${data.nunota} vinculado e personalização gravada.`
+          : `Nº Sankhya ${data.nunota} vinculado, mas a personalização não foi gravada.`}
+      >
+        {data.errors?.length > 0 && <s-paragraph>Erros: {data.errors.join(" · ")}</s-paragraph>}
+        {!data.errors?.length && data.sent === 0 && (
+          <s-paragraph>Confira o status Sankhya do pedido (vendedor sem atributos ou sem personalização).</s-paragraph>
+        )}
+      </s-banner>
+    );
+  }
+  if (data.action === "markDone") {
+    return <s-banner tone="success" heading={`${data.done} pedido(s) concluído(s) — removidos do alerta de pendências.`} />;
+  }
+  return null;
+}
+
+// Resultado somado de uma ação em lote (enviada em fatias).
+const BULK_LABEL = { send: "Envio ao ClickUp", sendForce: "Reenvio forçado ao ClickUp", sendSankhya: "Envio ao Sankhya", markDone: "Concluir" };
+function BulkResult({ bulk, onDismiss }) {
+  if (!bulk) return null;
+  const a = bulk.agg;
+  const label = BULK_LABEL[bulk.intent] || "Ação em lote";
+  if (!bulk.finished) {
+    return (
+      <s-banner tone="info" heading={`${label}: processando ${Math.min(bulk.done + BULK_CHUNK, bulk.total)} de ${bulk.total}…`}>
+        Não feche a página até terminar.
+      </s-banner>
+    );
+  }
+  let heading = `${label} concluído (${bulk.total} pedido(s)).`;
+  if (bulk.intent === "send" || bulk.intent === "sendForce") heading = `${a.created || 0} tarefa(s) criada(s) no ClickUp.`;
+  if (bulk.intent === "sendSankhya") heading = `Sankhya: ${a.sent || 0} gravado(s), ${a.pending || 0} pendente(s)${a.sellers ? `, ${a.sellers} vendedor(es) ignorado(s)` : ""}.`;
+  if (bulk.intent === "markDone") heading = `${a.done || 0} pedido(s) concluído(s) — removidos do alerta de pendências.`;
+  return (
+    <s-banner tone={a.errors.length ? "warning" : "success"} heading={heading} dismissible onDismiss={onDismiss}>
+      <s-stack gap="small-300">
+        {a.skipped > 0 && <s-paragraph>{a.skipped} ignorado(s) (já enviados ou sem personalização).</s-paragraph>}
+        {a.skippedExpired > 0 && <s-paragraph>{a.skippedExpired} bloqueado(s) por estarem expirados (não enviados ao ClickUp).</s-paragraph>}
+        {a.errors.length > 0 && <s-paragraph>Erros: {a.errors.join(" · ")}</s-paragraph>}
+      </s-stack>
+    </s-banner>
   );
 }

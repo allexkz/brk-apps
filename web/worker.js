@@ -81,6 +81,7 @@ async function handlePhoneCapture(request, env) {
 }
 
 const DRAIN_INTERVAL_MS = 15 * 60 * 1000; // 15 min
+const DRAIN_BURST_MS = 60 * 1000; // 1 min quando o lote do ciclo veio cheio
 
 // Durable Object fixado em São Paulo (locationHint "sam" no .get). Faz o drain do
 // Sankhya DE DENTRO do Brasil, contornando o bloqueio da Cloudflare do Sankhya a
@@ -101,7 +102,10 @@ export class SankhyaDrainer {
     await this.state.storage.setAlarm(Date.now() + DRAIN_INTERVAL_MS);
     try {
       const r = await drainSankhyaQueue(this.env, this.env.SESSIONS, SHOP_DOMAIN);
-      console.log(`[drainer] processed=${r.processed} sent=${r.sent} pending=${r.pending} errors=${r.errors.length}`);
+      console.log(`[drainer] processed=${r.processed} sent=${r.sent} pending=${r.pending} errors=${r.errors.length}${r.full ? " (lote cheio → próximo em 1 min)" : ""}`);
+      // Lote cheio (fila do D1 com mais itens vencidos): roda de novo em 1 min em vez de
+      // 15 — vazão em picos sem aumentar o tamanho (e o custo) de cada ciclo.
+      if (r.full) await this.state.storage.setAlarm(Date.now() + DRAIN_BURST_MS);
     } catch (e) {
       console.error("[drainer]", e?.message || e);
     }

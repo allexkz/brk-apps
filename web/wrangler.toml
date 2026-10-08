@@ -27,6 +27,15 @@ binding = "BUNDLES_DB"
 database_name = "brk-bundles-agro"
 database_id = "71ae51ce-5474-4de2-a662-0b3e42f3596b"
 
+# BRK Personalizados — estado do pipeline Sankhya por pedido (substitui os mapas do KV que
+# cresciam com o histórico). Banco próprio, separado do D1 dos bundles. Migração (remoto):
+#   wrangler d1 migrations apply PERSO_DB --remote
+[[d1_databases]]
+binding = "PERSO_DB"
+database_name = "brk-perso-agro"
+database_id = "5e35ab82-4b04-4cd8-ab5f-a6620c26250f"
+migrations_dir = "migrations-perso"
+
 # Durable Object (SQLite, disponível no Free) que roda o drain do Sankhya a partir de
 # São Paulo (locationHint "sam" no .get). Necessário porque a Cloudflare que protege a
 # API do Sankhya bloqueia requisições de fora do Brasil (o cron normal sai de Singapura
