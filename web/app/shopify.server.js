@@ -25,7 +25,10 @@ export function getShopify(env) {
     _shopify = shopifyApp({
       apiKey: env.SHOPIFY_API_KEY,
       apiSecretKey: env.SHOPIFY_API_SECRET || "",
-      apiVersion: ApiVersion.January26,
+      // Versão explícita da Admin API (a lib >= 12 exige). 2026-10 = suporte até ~out/2027.
+      // Antes (lib 11) January26 não existia → caía na 2025-07 e a Shopify servia a mais
+      // antiga suportada. Ao atualizar, validar as queries na versão nova.
+      apiVersion: ApiVersion.October26,
       scopes: env.SCOPES?.split(","),
       appUrl: env.SHOPIFY_APP_URL || "",
       authPathPrefix: "/auth",

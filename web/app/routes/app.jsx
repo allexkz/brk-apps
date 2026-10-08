@@ -19,11 +19,16 @@ export default function App() {
 
   return (
     <AppProvider isEmbeddedApp apiKey={apiKey}>
+      {/* Polaris web components (<s-*>), logo após o app-bridge.js (ordem documentada).
+          Canal "polaris-1" fixo na v1 (a v2 não entra sozinha). Convive com o Polaris
+          React das outras telas (Shadow DOM, sem conflito de CSS). */}
+      <script src="https://cdn.shopify.com/shopifycloud/polaris-1.js" />
       <NavMenu>
         <Link to="/app" rel="home">Início</Link>
         <Link to="/app/grupos-de-produtos">Grupos de Produtos</Link>
         <Link to="/app/personalizados">Personalizados</Link>
         <Link to="/app/descontos">Descontos</Link>
+        <Link to="/app/skus-sankhya">SKUs Sankhya</Link>
       </NavMenu>
       <Outlet />
     </AppProvider>

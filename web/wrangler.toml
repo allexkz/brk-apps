@@ -16,6 +16,21 @@ SHOPIFY_APP_URL = "https://brk-apps-motors.allexadriel.workers.dev"
 binding = "SESSIONS"
 id = "a97c2751ab4c4b2f8c443ffcf087a1bf"
 
+# BRK Personalizados — estado do pipeline Sankhya por pedido (substitui os mapas do KV que
+# cresciam com o histórico). Migração (remoto):
+#   wrangler d1 migrations apply PERSO_DB --remote
+[[d1_databases]]
+binding = "PERSO_DB"
+database_name = "brk-perso-motors"
+database_id = "0dea9fdc-9223-46f1-bbe7-e6d29477549e"
+migrations_dir = "migrations-perso"
+
+# Workers Logs (incluso no Free, com cota diária de eventos): CPU/erros por request no
+# painel do Cloudflare — usado para acompanhar estouros de CPU (Error 1102).
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 # Durable Object (SQLite, disponível no Free) que roda o drain do Sankhya a partir de
 # São Paulo (locationHint "sam" no .get). Necessário porque a Cloudflare que protege a
 # API do Sankhya bloqueia requisições de fora do Brasil (o cron normal sai de Singapura
