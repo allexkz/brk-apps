@@ -20,6 +20,22 @@
 
 import { findSellerForTags } from "./vendedores";
 import { fetchCabByNunota, fetchNunotasByShopifyIds, sendPersonalizationsToSankhya } from "./sankhya.server";
+import { getD1Store } from "./perso-store.server";
+
+// ── Pipeline no D1 (custo constante) ──
+// Com o binding PERSO_DB (e a cópia KV → D1 feita), o estado de cada pedido vive numa
+// linha do D1 e cada operação toca só os pedidos envolvidos. Sem PERSO_DB, as funções
+// abaixo seguem pelo caminho antigo (mapas do KV), intacto.
+export const QUEUE_LIMIT = 15; // pedidos por ciclo do envio automático (≤ ~31 subrequests)
+export const GIVE_UP_DAYS = 7; // após isso sem conseguir gravar, para de tentar sozinho
+const DAY_MS_PIPE = 86400000;
+const STALLED_PREFIX = `Parado: há mais de ${GIVE_UP_DAYS} dias sem conseguir gravar — envio automático encerrado (use "Vincular Nº", "Enviar Sankhya" ou "Concluir").`;
+
+// Espera crescente entre tentativas: 15 min, 30, 60, ... até 24 h.
+function backoffNextISO(attempts, nowMs) {
+  const mins = Math.min(15 * 2 ** Math.max(0, attempts - 1), 24 * 60);
+  return new Date(nowMs + mins * 60000).toISOString();
+}
 
 export const ORDER_TAG = "Nome Personalizado";
 export const PERSO_SKU = "PE1198";
@@ -78,6 +94,11 @@ function hasAttrs(o) {
 // custom com título "PE1198" (vendedor adiciona sem SKU, via draft order).
 function isPersoLine(sku, title) {
   return sku === PERSO_SKU || String(title || "").trim().toUpperCase() === PERSO_SKU;
+}
+
+// O pedido (formato REST/webhook) tem alguma linha de personalização (PE1198)?
+export function orderHasPersoLine(order) {
+  return (order?.line_items || []).some((li) => isPersoLine(li.sku, li.title));
 }
 
 // Só os campos gravados no Sankhya (mantém o job em KV enxuto).
@@ -197,6 +218,7 @@ export function buildPersoFromRestOrder(order, sellers) {
   return {
     legacyId: String(order.id),
     name: order.name || `#${order.order_number ?? ""}`,
+    createdAt: order.created_at || null,
     seller: seller?.name || null,
     rawPerso: persoLines.length,
     personalizations,
@@ -233,7 +255,7 @@ function chunkArr(arr, size) {
 }
 
 // Produtos (por id) que têm QUALQUER variante com 'FULL' no SKU = envio imediato.
-async function getFullProductIds(admin, productIds) {
+export async function getFullProductIds(admin, productIds) {
   const set = new Set();
   for (const ids of chunkArr(productIds, 15)) {
     const res = await admin.graphql(
@@ -410,6 +432,84 @@ const DONE_REASON = "Concluído manualmente (marcado como resolvido).";
 //   legacyIds = lista específica; null = todos com retry===true (uso do cron).
 // Retorna { processed, sent, pending, errors }.
 export async function processPersoJobs(env, kv, shop, legacyIds = null) {
+  const store = await getD1Store(env, kv, shop);
+  if (store) return processPersoJobsD1(env, kv, store, legacyIds);
+  return processPersoJobsKV(env, kv, shop, legacyIds);
+}
+
+// Versão D1: lê só os jobs pedidos (ou a fila vencida, LIMIT QUEUE_LIMIT) e grava só eles.
+async function processPersoJobsD1(env, kv, store, legacyIds = null) {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const jobs = legacyIds ? await store.getJobs(legacyIds) : await store.getQueue(nowIso, QUEUE_LIMIT);
+  const targetIds = (legacyIds ? legacyIds.map(String) : Object.keys(jobs)).filter((id) => jobs[id]);
+  if (targetIds.length === 0) return { processed: 0, sent: 0, pending: 0, errors: [], full: false };
+
+  // Nº Sankhya: o que já temos + busca em lote só dos que faltam (limitado aos alvos).
+  const nunotas = await store.getNunotas(targetIds);
+  const needNunota = targetIds.filter((id) => nunotas[id] == null);
+  if (needNunota.length) {
+    try {
+      const fetched = await fetchNunotasByShopifyIds(env, kv, needNunota, { empresa: SANKHYA_EMPRESA });
+      const found = {};
+      for (const [id, nu] of Object.entries(fetched)) if (nu != null) found[id] = nu;
+      if (Object.keys(found).length) {
+        await store.saveNunotas(found);
+        Object.assign(nunotas, found);
+      }
+    } catch (e) {
+      console.error("[perso sankhya nunota]", e?.message || e);
+    }
+  }
+
+  // Pendente: mantém o `at` (início da pendência) enquanto continua pendente — base do
+  // prazo de GIVE_UP_DAYS. Passado o prazo, sai da fila (retry=false) e fica em "Presos".
+  const updates = {};
+  const pendingUpdate = (job, reason, attempts) => {
+    const since = job.status === "pending" && job.at ? job.at : nowIso;
+    const expired = nowMs - Date.parse(since) >= GIVE_UP_DAYS * DAY_MS_PIPE;
+    return expired
+      ? { ...job, status: "pending", retry: false, reason: `${STALLED_PREFIX} Último motivo: ${reason}`, attempts, nextTryAt: null, at: since }
+      : { ...job, status: "pending", retry: true, reason, attempts, nextTryAt: backoffNextISO(attempts, nowMs), at: since };
+  };
+
+  const toSend = [];
+  for (const id of targetIds) {
+    const job = jobs[id];
+    const nunota = nunotas[id] ?? null;
+    if (nunota == null) {
+      updates[id] = pendingUpdate(job, PENDING_NUNOTA_REASON, (job.attempts || 0) + 1);
+      continue;
+    }
+    toSend.push({ legacyId: id, name: job.name, nunota, personalizations: job.personalizations || [] });
+  }
+
+  let sent = 0;
+  const errors = [];
+  if (toSend.length) {
+    const results = await sendPersonalizationsToSankhya(env, kv, toSend);
+    for (const r of results) {
+      const job = jobs[r.legacyId] || {};
+      if (r.ok) {
+        updates[r.legacyId] = { ...job, status: "sent", retry: false, reason: null, nunota: r.nunota, written: r.written, attempts: 0, nextTryAt: null, at: nowIso };
+        sent++;
+      } else if (isPermanentError(r.error)) {
+        updates[r.legacyId] = { ...job, status: "error", retry: false, reason: r.error || "erro", nunota: r.nunota ?? job.nunota ?? null, nextTryAt: null, at: nowIso };
+        errors.push(`${job.name || r.legacyId}: ${r.error}`);
+      } else {
+        updates[r.legacyId] = { ...pendingUpdate(job, r.error || "erro", (job.attempts || 0) + 1), nunota: r.nunota ?? job.nunota ?? null };
+        errors.push(`${job.name || r.legacyId}: ${r.error}`);
+      }
+    }
+  }
+
+  await store.saveJobs(updates);
+  const pending = targetIds.filter((id) => updates[id]?.status === "pending").length;
+  return { processed: targetIds.length, sent, pending, errors, full: !legacyIds && targetIds.length >= QUEUE_LIMIT };
+}
+
+// Versão KV (caminho anterior, inalterado) — usada sem PERSO_DB ou antes da cópia KV → D1.
+async function processPersoJobsKV(env, kv, shop, legacyIds = null) {
   const status = await loadSankhyaStatus(kv, shop);
   const nunotas = await loadNunotas(kv, shop);
 
@@ -502,6 +602,12 @@ export async function processPersoJobs(env, kv, shop, legacyIds = null) {
 // hora (best-effort; normalmente cai em "pending" por falta de NUNOTA → cron reprocessa).
 export async function ingestPersoOrder(env, kv, shop, perso) {
   if (!perso || !perso.legacyId) return;
+  // Sem PE1198 e sem vendedor: nada a gravar (os ramos abaixo só agem com um dos dois).
+  // Sai ANTES de ler/parsear o mapa de status — a maioria dos pedidos cai aqui e o
+  // parse do mapa inteiro custava CPU do Worker em todo webhook orders/create.
+  if (!perso.rawPerso && !perso.seller) return;
+  const store = await getD1Store(env, kv, shop);
+  if (store) return ingestPersoOrderD1(env, kv, store, perso);
   const id = perso.legacyId;
   const status = await loadSankhyaStatus(kv, shop);
 
@@ -530,11 +636,54 @@ export async function ingestPersoOrder(env, kv, shop, perso) {
   }
 }
 
+// Versão D1 da ingestão: lê/grava só a linha deste pedido.
+async function ingestPersoOrderD1(env, kv, store, perso) {
+  const id = String(perso.legacyId);
+  const cur = (await store.getJobs([id]))[id];
+  if (cur?.status === "sent") return; // idempotente (reentrega do webhook)
+  const base = { name: perso.name, orderCreatedAt: perso.createdAt || null, at: nowISO() };
+
+  // Sem PE1198 = fora do universo da dashboard (pedido de vendedor sem personalização):
+  // no D1 não registramos (no KV antigo esses ~95% dos "seller" inflavam o mapa à toa).
+  if (!perso.rawPerso) return;
+  if (perso.seller && !perso.personalizations?.length) {
+    await store.saveJobs({ [id]: { ...base, status: "seller", retry: false, seller: perso.seller, personalizations: [], hasAttrs: false } });
+    return;
+  }
+  if (!perso.personalizations?.length) {
+    await store.saveJobs({ [id]: { ...base, status: "error", retry: false, reason: "PE1198 sem atributos do modal.", personalizations: [], hasAttrs: false } });
+    return;
+  }
+  await store.saveJobs({
+    [id]: {
+      ...base,
+      status: "pending",
+      retry: true,
+      reason: PENDING_NUNOTA_REASON,
+      seller: perso.seller || null,
+      personalizations: perso.personalizations.map(slimPerso),
+      attempts: 0,
+      nextTryAt: base.at,
+      hasAttrs: true,
+    },
+  });
+  try {
+    await processPersoJobsD1(env, kv, store, [id]);
+  } catch (e) {
+    console.error("[perso ingest process]", e?.message || e);
+  }
+}
+
 // Dreno do cron: reprocessa os jobs pendentes/transitórios (retry===true). Quando NÃO
 // há nada pendente, processPersoJobs retorna sem NENHUMA escrita no KV (só 2 leituras,
 // que são praticamente ilimitadas) — ou seja, o cron só "gasta" quando existe pedido
 // real a enviar. A saúde é medida pela idade dos pendentes (não por heartbeat).
 export async function drainSankhyaQueue(env, kv, shop) {
+  // D1: só a fila vencida (índice + LIMIT). Ocioso = 1 query que volta vazia.
+  // `full` = lote cheio → o alarme roda de novo em 1 min (vazão em picos).
+  const store = await getD1Store(env, kv, shop);
+  if (store) return processPersoJobsD1(env, kv, store, null);
+
   // ANTES de qualquer escrita: só há trabalho se existir job com retry===true. A leitura
   // do status é barata (KV read ~ilimitado no free tier); o PUT é o recurso escasso. Sem
   // essa guarda, cada ciclo do cron forçava um token novo no KV mesmo ocioso — o que
@@ -552,6 +701,8 @@ export async function drainSankhyaQueue(env, kv, shop) {
 // selecionados na dashboard. Faz upsert dos jobs (pula vendedores) e processa já.
 // Retorna { processed, sent, pending, errors, sellers, noAttr }.
 export async function reprocessOrders(env, kv, shop, orderDatas, sellers) {
+  const store = await getD1Store(env, kv, shop);
+  if (store) return reprocessOrdersD1(env, kv, store, orderDatas, sellers);
   const status = await loadSankhyaStatus(kv, shop);
   const updates = {};
   const targets = [];
@@ -581,10 +732,65 @@ export async function reprocessOrders(env, kv, shop, orderDatas, sellers) {
   return { ...res, sellers: sellerCount, noAttr };
 }
 
+// Versão D1 do reprocesso manual (só os pedidos selecionados).
+async function reprocessOrdersD1(env, kv, store, orderDatas, sellers) {
+  const ids = (orderDatas || []).map((od) => od.legacyId).filter(Boolean);
+  const existing = await store.getJobs(ids);
+  const now = nowISO();
+  const updates = {};
+  const targets = [];
+  let sellerCount = 0;
+  let noAttr = 0;
+  for (const od of orderDatas || []) {
+    if (!od.legacyId) continue;
+    const id = String(od.legacyId);
+    const seller = findSellerForTags(od.tags, sellers);
+    const base = { name: od.name, orderCreatedAt: od.createdAt || null, at: now };
+    if (seller && !od.personalizations?.length) {
+      updates[id] = { ...base, status: "seller", retry: false, seller: seller.name, personalizations: [], hasAttrs: false };
+      sellerCount++;
+      continue;
+    }
+    if (!od.personalizations?.length) {
+      updates[id] = { ...base, status: "error", retry: false, reason: "PE1198 sem atributos do modal.", personalizations: [], hasAttrs: false };
+      noAttr++;
+      continue;
+    }
+    // Força reprocesso: reinicia a pendência (prazo de GIVE_UP_DAYS conta de novo).
+    updates[id] = {
+      ...(existing[id] || {}),
+      ...base,
+      status: "pending",
+      retry: true,
+      reason: null,
+      seller: seller?.name || null,
+      personalizations: od.personalizations.map(slimPerso),
+      attempts: 0,
+      nextTryAt: now,
+      hasAttrs: true,
+    };
+    targets.push(id);
+  }
+  await store.saveJobs(updates);
+  const res = await processPersoJobsD1(env, kv, store, targets);
+  return { ...res, sellers: sellerCount, noAttr };
+}
+
 // Marca pedidos como CONCLUÍDOS/encerrados manualmente: status "done" (retry:false), tirando-os
 // do alerta de pendências e do reenvio automático. NÃO marca como "sent"/gravado no Sankhya nem
 // toca no ClickUp — é só "resolvido, não me cobre mais". Reversível via reprocessOrders. { done }.
-export async function completeOrders(kv, shop, legacyIds = []) {
+export async function completeOrders(kv, shop, legacyIds = [], env = null) {
+  const store = env ? await getD1Store(env, kv, shop) : null;
+  if (store) {
+    const jobs = await store.getJobs(legacyIds);
+    const now = nowISO();
+    const updates = {};
+    for (const id of legacyIds) {
+      updates[id] = { ...(jobs[id] || {}), status: "done", retry: false, manual: true, reason: DONE_REASON, nextTryAt: null, at: now };
+    }
+    if (legacyIds.length) await store.saveJobs(updates);
+    return { done: legacyIds.length };
+  }
   const status = await loadSankhyaStatus(kv, shop);
   const updates = {};
   let done = 0;
@@ -611,6 +817,18 @@ export async function setManualNunota(env, kv, shop, legacyId, nunota) {
   if (!cab) return { ok: false, error: `Nº Sankhya ${n} não encontrado no Sankhya.` };
   if (cab.pedEcommerce && cab.pedEcommerce !== id) {
     return { ok: false, error: `Nº Sankhya ${n} já está vinculado a outro pedido da Shopify (id ${cab.pedEcommerce}).` };
+  }
+
+  // D1: checagem de duplicidade pelo índice de Nº Sankhya (não carrega o histórico).
+  const store = await getD1Store(env, kv, shop);
+  if (store) {
+    const owner = await store.findNunotaOwner(n, id);
+    if (owner) {
+      return { ok: false, error: `Nº Sankhya ${n} já está vinculado a outro pedido na dashboard (id ${owner}).` };
+    }
+    await store.saveNunotas({ [id]: n });
+    await store.markNunotaManual(id);
+    return { ok: true, cab };
   }
 
   const nunotas = await loadNunotas(kv, shop);

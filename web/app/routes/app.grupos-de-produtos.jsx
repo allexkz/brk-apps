@@ -92,17 +92,26 @@ async function ensureDefinitions(admin) {
   }
 }
 
-async function loadIndex(admin) {
+// `checkDefs`: na mesma request, confere se as metafield definitions já existem — o loader
+// só roda as mutações de criação quando falta alguma (antes rodava 2 mutações a cada
+// acesso, que sempre falhavam com "taken" e custavam CPU no Worker). Nada muda nos dados.
+async function loadIndex(admin, { checkDefs = false } = {}) {
   const res = await admin.graphql(
     `query {
       shop {
         id
         metafield(namespace: "${NS}", key: "${KEY_INDEX}") { value }
       }
+      ${checkDefs ? `metafieldDefinitions(ownerType: PRODUCT, namespace: "${NS}", first: 10) { nodes { key } }` : ""}
     }`
   );
   const data = await res.json();
   const shopId = data.data.shop.id;
+  let missingDefs = false;
+  if (checkDefs) {
+    const have = new Set((data.data.metafieldDefinitions?.nodes || []).map((n) => n.key));
+    missingDefs = !have.has(KEY_LISTING) || !have.has(KEY_GROUP);
+  }
   const raw = data.data.shop.metafield?.value;
   let groups = [];
   try {
@@ -110,7 +119,7 @@ async function loadIndex(admin) {
   } catch {
     groups = [];
   }
-  return { shopId, groups };
+  return { shopId, groups, missingDefs };
 }
 
 async function saveIndex(admin, shopId, groups) {
@@ -288,8 +297,8 @@ export const loader = async ({ request, context }) => {
   const shopify = getShopify(context.env);
   const { admin } = await shopify.authenticate.admin(request);
 
-  await ensureDefinitions(admin);
-  const { groups } = await loadIndex(admin);
+  const { groups, missingDefs } = await loadIndex(admin, { checkDefs: true });
+  if (missingDefs) await ensureDefinitions(admin);
 
   return json({ groups });
 };

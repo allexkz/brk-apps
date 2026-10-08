@@ -13,8 +13,8 @@
     "@remix-run/react": "^2.16.0",
     "@shopify/app-bridge-react": "^4.1.0",
     "@shopify/polaris": "^13.0.0",
-    "@shopify/shopify-app-remix": "^3.0.0",
-    "@shopify/shopify-api": "^11.0.0",
+    "@shopify/shopify-app-remix": "^6.0.1",
+    "@shopify/shopify-api": "^15.0.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },

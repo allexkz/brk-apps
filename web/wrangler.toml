@@ -6,6 +6,12 @@ compatibility_flags = ["nodejs_compat_v2"]
 [assets]
 directory = "./build/client"
 
+# Workers Logs (incluso no Free, com cota diária de eventos): CPU/erros por request no
+# painel do Cloudflare — usado para acompanhar estouros de CPU (Error 1102).
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [vars]
 SHOPIFY_APP_URL = "https://brk-apps-fishing.allexadriel.workers.dev"
 
@@ -22,6 +28,15 @@ id = "9702058e0ee54a27b3de4ff2e0c275f2"
 binding = "BUNDLES_DB"
 database_name = "brk-bundles-fishing"
 database_id = "ba68e16d-37aa-4914-982d-46d381674554"
+
+# BRK Personalizados — estado do pipeline Sankhya por pedido (substitui os mapas do KV que
+# cresciam com o histórico). Banco próprio, separado do D1 dos bundles. Migração (remoto):
+#   wrangler d1 migrations apply PERSO_DB --remote
+[[d1_databases]]
+binding = "PERSO_DB"
+database_name = "brk-perso-fishing"
+database_id = "8e7dda2b-a220-405a-801f-e0bb5c37ac98"
+migrations_dir = "migrations-perso"
 
 # Durable Object (SQLite, disponível no Free) que roda o drain do Sankhya a partir de
 # São Paulo (locationHint "sam" no .get). Necessário porque a Cloudflare que protege a
