@@ -15,7 +15,8 @@
     { id, name, enabled, display: 'inline'|'popup', priority, exclusive, chooseMax, hidePrice,
       title, subtitle,
       targets: { type, productIds:[num], collectionIds:[num], tags:[str],
-                 metafield:{ namespace, key, value } },
+                 metafield:{ namespace, key, value },
+                 exclude?:{ productIds:[str], collectionIds:[str], tags:[str] } },
       addons: [ { productId, title, image, mode, value, label, maxQty, preselected,
                   variants:[{ variantId, title, priceCents, available }] } ] }
 
@@ -32,8 +33,54 @@
   Fallback (antes de `live` existir): índice legado por produto `applies` (já
   casado) + `dynamic` (bundles por metafield).
 {%- endcomment -%}
+{%- comment -%}
+  Vitrine v2 (`brk_bundles.live_index` com `on`): em vez de varrer o `live` inteiro
+  (JSON único com todos os bundles, limite de 128 KB), os candidatos são só os
+  bundles deste produto (metafield `brk_bundles.fn` do produto, gravado pelo app) +
+  os bundles amplos do índice que casam com as collections/tags dele. Cada candidato
+  vira "ordem|handle" (ordem = prioridade e, empatando, o mais novo primeiro — igual
+  ao `sort: 'priority' | reverse` do `live`), e os detalhes vêm do registro do
+  bundle (campo `storefront`, mesmo formato do `live`). O laço principal abaixo é o
+  mesmo dos dois caminhos: casa a segmentação, exclusões e exclusivo de novo.
+  No máximo 12 registros buscados por página (limite de buscas por handle da Shopify).
+{%- endcomment -%}
+{%- assign bd_pid = product.id | append: '' -%}
+{%- capture bd_colls -%},{%- for c in product.collections -%}{{ c.id }},{%- endfor -%}{%- endcapture -%}
+{%- capture bd_tags -%}|{{ product.tags | join: '|' | downcase }}|{%- endcapture -%}
+{%- assign bd_v2 = false -%}
+{%- assign bd_ix = shop.metafields.brk_bundles.live_index.value -%}
+{%- if bd_ix and bd_ix.on -%}{%- assign bd_v2 = true -%}{%- endif -%}
 {%- assign live = shop.metafields.brk_bundles.live.value -%}
-{%- if live -%}
+{%- if bd_v2 -%}
+  {%- assign live_mode = true -%}
+  {%- assign bd_keys = '' -%}
+  {%- assign bd_fn = product.metafields.brk_bundles.fn.value -%}
+  {%- for bd_pair in bd_fn -%}
+    {%- if bd_pair[1].h != blank -%}
+      {%- assign bd_keys = bd_keys | append: bd_pair[1].o | append: '|' | append: bd_pair[1].h | append: ',' -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- for bd_e in bd_ix.b -%}
+    {%- assign bd_pre = true -%}
+    {%- if bd_e.t.type == 'collections' -%}
+      {%- assign bd_pre = false -%}
+      {%- for cid in bd_e.t.collectionIds -%}
+        {%- assign needle = ',' | append: cid | append: ',' -%}
+        {%- if bd_colls contains needle -%}{%- assign bd_pre = true -%}{%- break -%}{%- endif -%}
+      {%- endfor -%}
+    {%- elsif bd_e.t.type == 'tags' -%}
+      {%- assign bd_pre = false -%}
+      {%- for tg in bd_e.t.tags -%}
+        {%- assign needle = tg | downcase | prepend: '|' | append: '|' -%}
+        {%- if bd_tags contains needle -%}{%- assign bd_pre = true -%}{%- break -%}{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {%- if bd_pre -%}
+      {%- assign bd_keys = bd_keys | append: bd_e.o | append: '|' | append: bd_e.h | append: ',' -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- assign candidates = bd_keys | split: ',' | sort | reverse -%}
+{%- elsif live -%}
   {%- assign candidates = live -%}
   {%- assign live_mode = true -%}
 {%- else -%}
@@ -50,10 +97,6 @@
 {%- endif -%}
 
 {%- if candidates and candidates.size > 0 -%}
-  {%- comment -%} chaves delimitadas p/ busca exata por substring {%- endcomment -%}
-  {%- assign bd_pid = product.id | append: '' -%}
-  {%- capture bd_colls -%},{%- for c in product.collections -%}{{ c.id }},{%- endfor -%}{%- endcapture -%}
-  {%- capture bd_tags -%}|{{ product.tags | join: '|' | downcase }}|{%- endcapture -%}
 
   {%- capture brk_bundle_vars -%}
     --brk-bd-border: {{ block.settings.border_color | default: '#E1E3E5' }};
@@ -65,11 +108,25 @@
     --brk-bd-margin-y: {{ block.settings.margin_y | default: 16 }}px;
   {%- endcapture -%}
 
-  {%- assign sorted = candidates | sort: 'priority' | reverse -%}
+  {%- if bd_v2 -%}
+    {%- assign sorted = candidates -%}
+  {%- else -%}
+    {%- assign sorted = candidates | sort: 'priority' | reverse -%}
+  {%- endif -%}
   {%- capture bd_html -%}
     {%- assign excl_active = false -%}
     {%- assign excl_priority = 0 -%}
-    {%- for bundle in sorted -%}
+    {%- assign bd_lookups = 0 -%}
+    {%- for bd_item in sorted -%}
+      {%- if bd_v2 -%}
+        {%- if bd_lookups >= 12 -%}{%- break -%}{%- endif -%}
+        {%- assign bd_lookups = bd_lookups | plus: 1 -%}
+        {%- assign bd_h = bd_item | split: '|' | last -%}
+        {%- assign bundle = shop.metaobjects['$app:brk_bundle'][bd_h].storefront.value -%}
+        {%- if bundle == blank -%}{%- continue -%}{%- endif -%}
+      {%- else -%}
+        {%- assign bundle = bd_item -%}
+      {%- endif -%}
       {%- if bundle.enabled == false -%}{%- continue -%}{%- endif -%}
       {%- if bundle.addons == blank or bundle.addons.size == 0 -%}{%- continue -%}{%- endif -%}
 
@@ -101,6 +158,26 @@
           {%- for tg in bundle.targets.tags -%}
             {%- assign needle = tg | downcase | prepend: '|' | append: '|' -%}
             {%- if bd_tags contains needle -%}{%- assign is_match = true -%}{%- break -%}{%- endif -%}
+          {%- endfor -%}
+        {%- endif -%}
+      {%- endif -%}
+
+      {%- comment -%} exclusões (produtos / collections / tags): vencem a segmentação {%- endcomment -%}
+      {%- if is_match and live_mode and bundle.targets.exclude -%}
+        {%- for xid in bundle.targets.exclude.productIds -%}
+          {%- assign xid_s = xid | append: '' -%}
+          {%- if xid_s == bd_pid -%}{%- assign is_match = false -%}{%- break -%}{%- endif -%}
+        {%- endfor -%}
+        {%- if is_match -%}
+          {%- for cid in bundle.targets.exclude.collectionIds -%}
+            {%- assign needle = ',' | append: cid | append: ',' -%}
+            {%- if bd_colls contains needle -%}{%- assign is_match = false -%}{%- break -%}{%- endif -%}
+          {%- endfor -%}
+        {%- endif -%}
+        {%- if is_match -%}
+          {%- for tg in bundle.targets.exclude.tags -%}
+            {%- assign needle = tg | downcase | prepend: '|' | append: '|' -%}
+            {%- if bd_tags contains needle -%}{%- assign is_match = false -%}{%- break -%}{%- endif -%}
           {%- endfor -%}
         {%- endif -%}
       {%- endif -%}
