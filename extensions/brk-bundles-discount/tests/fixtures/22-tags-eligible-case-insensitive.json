@@ -26,7 +26,8 @@
                     "tag": "Agro Kids",
                     "hasTag": true
                   }
-                ]
+                ],
+                "fn": null
               }
             }
           },
@@ -57,7 +58,8 @@
                     "tag": "Agro Kids",
                     "hasTag": false
                   }
-                ]
+                ],
+                "fn": null
               }
             }
           }

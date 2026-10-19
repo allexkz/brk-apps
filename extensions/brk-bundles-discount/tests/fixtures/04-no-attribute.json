@@ -21,7 +21,8 @@
               "product": {
                 "id": "gid://shopify/Product/111",
                 "inCollections": [],
-                "hasTags": []
+                "hasTags": [],
+                "fn": null
               }
             }
           }

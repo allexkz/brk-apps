@@ -16,32 +16,32 @@ export type Scalars = {
    * Represents an [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601)-encoded date string.
    * For example, September 7, 2019 is represented as `"2019-07-16"`.
    */
-  Date: { input: any; output: any; }
+  Date: { input: string; output: string; }
   /**
    * Represents an [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601)-encoded date and time string.
    * For example, 3:50 pm on September 7, 2019 in the time zone of UTC (Coordinated Universal Time) is
    * represented as `"2019-09-07T15:50:00Z`".
    */
-  DateTime: { input: any; output: any; }
+  DateTime: { input: string; output: string; }
   /**
    * A subset of the [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) format that
    * includes the date and time but not the timezone which is determined from context.
    *
    * For example, "2018-01-01T00:00:00".
    */
-  DateTimeWithoutTimezone: { input: any; output: any; }
+  DateTimeWithoutTimezone: { input: string; output: string; }
   /**
    * A signed decimal number, which supports arbitrary precision and is serialized as a string.
    *
    * Example values: `"29.99"`, `"29.999"`.
    */
-  Decimal: { input: any; output: any; }
+  Decimal: { input: string; output: string; }
   /**
    * A function-scoped handle to a refer a resource.
    * The Handle type appears in a JSON response as a String, but it is not intended to be human-readable.
    * Example value: `"10079785100"`
    */
-  Handle: { input: any; output: any; }
+  Handle: { input: string; output: string; }
   /**
    * A [JSON](https://www.json.org/json-en.html) object.
    *
@@ -57,13 +57,13 @@ export type Scalars = {
    *   }
    * }`
    */
-  JSON: { input: any; output: any; }
+  JSON: { input: unknown; output: unknown; }
   /**
    * A subset of the [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) format that
    * includes the time but not the date or timezone which is determined from context.
    * For example, "05:43:21".
    */
-  TimeWithoutTimezone: { input: any; output: any; }
+  TimeWithoutTimezone: { input: string; output: string; }
   /**
    * Represents an [RFC 3986](https://datatracker.ietf.org/doc/html/rfc3986) and
    * [RFC 3987](https://datatracker.ietf.org/doc/html/rfc3987)-compliant URI string.
@@ -71,9 +71,9 @@ export type Scalars = {
    * For example, `"https://example.myshopify.com"` is a valid URL. It includes a scheme (`https`) and a host
    * (`example.myshopify.com`).
    */
-  URL: { input: any; output: any; }
+  URL: { input: string; output: string; }
   /** A void type that can be used to return a null value from a mutation. */
-  Void: { input: any; output: any; }
+  Void: { input: null; output: null; }
 };
 
 /** A discount code that is associated with a discount candidate. */
@@ -3236,9 +3236,9 @@ export enum WeightUnit {
 export type InputVariables = Exact<{ [key: string]: never; }>;
 
 
-export type Input = { __typename?: 'Input', enteredDiscountCodes: Array<{ __typename?: 'EnteredDiscountCode', code: string }>, cart: { __typename?: 'Cart', deliveryGroups: Array<{ __typename?: 'CartDeliveryGroup', deliveryOptions: Array<{ __typename?: 'CartDeliveryOption', handle: any, cost: { __typename?: 'MoneyV2', amount: any } }> }> }, discount: { __typename?: 'Discount', discountClasses: Array<DiscountClass> } };
+export type Input = { __typename?: 'Input', enteredDiscountCodes: Array<{ __typename?: 'EnteredDiscountCode', code: string }>, cart: { __typename?: 'Cart', deliveryGroups: Array<{ __typename?: 'CartDeliveryGroup', deliveryOptions: Array<{ __typename?: 'CartDeliveryOption', handle: string, cost: { __typename?: 'MoneyV2', amount: string } }> }> }, discount: { __typename?: 'Discount', discountClasses: Array<DiscountClass> } };
 
 export type CartInputVariables = Exact<{ [key: string]: never; }>;
 
 
-export type CartInput = { __typename?: 'Input', cart: { __typename?: 'Cart', lines: Array<{ __typename?: 'CartLine', id: string, cost: { __typename?: 'CartLineCost', subtotalAmount: { __typename?: 'MoneyV2', amount: any } } }> }, discount: { __typename?: 'Discount', discountClasses: Array<DiscountClass> } };
+export type CartInput = { __typename?: 'Input', cart: { __typename?: 'Cart', lines: Array<{ __typename?: 'CartLine', id: string, cost: { __typename?: 'CartLineCost', subtotalAmount: { __typename?: 'MoneyV2', amount: string } } }> }, discount: { __typename?: 'Discount', discountClasses: Array<DiscountClass> } };

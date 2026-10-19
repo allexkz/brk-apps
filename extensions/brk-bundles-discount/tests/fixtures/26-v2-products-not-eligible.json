@@ -21,7 +21,8 @@
               "product": {
                 "id": "gid://shopify/Product/222",
                 "inCollections": [],
-                "hasTags": []
+                "hasTags": [],
+                "fn": null
               }
             }
           },
@@ -47,7 +48,8 @@
               "product": {
                 "id": "gid://shopify/Product/999",
                 "inCollections": [],
-                "hasTags": []
+                "hasTags": [],
+                "fn": null
               }
             }
           }

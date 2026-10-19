@@ -27,16 +27,47 @@ import {
   EmptyState,
   IndexTable,
   Tag,
+  Modal,
   useIndexResourceState,
 } from "@shopify/polaris";
 import { useAppBridge } from "@shopify/app-bridge-react";
 
 import { getShopify } from "../shopify.server";
 import { statsByBundle, salesReport } from "../bundles-db.server";
+import {
+  loadBundles,
+  loadShopState,
+  listMetaobjectBundles,
+  upsertMetaobjectBundles,
+  writeMetaobjectBundles,
+  setMode,
+  compareBundles,
+  bytes,
+  LEGACY_MAX_BYTES,
+  isProductBundle,
+  assignFnKeys,
+  planProductFnWrites,
+  writeProductFn,
+  readProductFn,
+  scanProductFnPage,
+  setEngine,
+  bundleHandle,
+  orderKey,
+  metaobjectFullType,
+  KEY_LIVE_INDEX,
+} from "../bundles-store.server";
 
 const NS = "brk_bundles"; // shop metafield (fonte da verdade: admin/webhook/discount)
 const KEY = "config";
 const KEY_LIVE = "live"; // shop: bundles ativos, casados ao vivo no tema (derivado do config)
+const KEY_BACKUP = "config_backup"; // shop: cópia dos bundles alterados por operação em massa (rollback manual)
+const MIGRATE_PAGE = 40; // bundles por chamada na cópia p/ metaobjects (loop no cliente)
+const SHOPIFY_JSON_MAX = 131072; // limite de gravação de JSON (Admin API 2026-04+)
+const PRODUCT_FN_INLINE_MAX = 400; // produtos a regravar num save; acima disso, "Sincronizar produtos" (loop)
+const PRODUCT_FN_PAGE = 200; // produtos por chamada na sincronização
+const PRODUCT_BUNDLE_WARN = 100; // bundle "por produto" com mais produtos que isso: sugerir collection/tag
+// Opções que a ação em massa "Editar opções" pode mudar (whitelist do servidor).
+const BULK_OPTION_KEYS = ["exemption", "hidePrice", "showAddonDiscount"];
 // Legado (índice por produto, substituído por `live`): só lidos pelo fallback do
 // bloco e apagados pela limpeza.
 const KEY_APPLIES = "applies";
@@ -91,6 +122,7 @@ async function ensureDefinition(admin) {
   const defs = [
     { name: "BRK Bundles (config)", key: KEY, ownerType: "SHOP" },
     { name: "BRK Bundles (ao vivo)", key: KEY_LIVE, ownerType: "SHOP" },
+    { name: "BRK Bundles (índice da vitrine)", key: KEY_LIVE_INDEX, ownerType: "SHOP" },
   ];
   for (const d of defs) {
     await admin
@@ -132,22 +164,54 @@ function chunk(arr, size) {
 // (só usados pelo editor) ficam de fora. `priority` vira número (o `sort` do
 // Liquid põe nil no topo após o `reverse`). Derivado do config: pode ser recriado.
 function buildLive(bundles) {
-  return bundles
-    .filter((b) => b.enabled)
-    .map((b) => {
-      const t = b.targets || {};
-      return {
-        ...b,
-        priority: Number(b.priority) || 0,
-        targets: {
-          type: t.type,
-          productIds: (t.productIds || []).map(String),
-          collectionIds: (t.collectionIds || []).map(String),
-          tags: (t.tags || []).map(String),
-          metafield: t.metafield || { namespace: "", key: "", value: "" },
-        },
-      };
-    });
+  return bundles.filter((b) => b.enabled).map(liveItem);
+}
+
+// Um bundle no formato que o tema lê (item do `live` e campo `storefront` do registro).
+function liveItem(b) {
+  const t = b.targets || {};
+  const x = excludeOf(t);
+  return {
+    ...b,
+    priority: Number(b.priority) || 0,
+    targets: {
+      type: t.type,
+      productIds: (t.productIds || []).map(String),
+      collectionIds: (t.collectionIds || []).map(String),
+      tags: (t.tags || []).map(String),
+      metafield: t.metafield || { namespace: "", key: "", value: "" },
+      ...(hasExclude(x) ? { exclude: x } : {}),
+    },
+  };
+}
+
+// Vitrine v2: índice só com os bundles AMPLOS ativos (os por produto o tema acha no
+// `fn` do produto). `h` = handle do registro, `o` = ordem, `t` = segmentação (p/ o
+// tema já descartar os que não casam antes de buscar o registro).
+function buildLiveIndex(bundles, mo, on) {
+  return {
+    on: !!on,
+    mo,
+    b: bundles
+      .filter((b) => b.enabled && !isProductBundle(b))
+      .map((b) => ({ h: bundleHandle(b.id), o: orderKey(b), t: liveItem(b).targets })),
+  };
+}
+
+// Exclusões da segmentação (opcional; bundles antigos não têm): o produto que
+// casa com alguma delas nunca recebe o bundle, mesmo casando a segmentação.
+// Valem no tema (bundle-addon.liquid) e na function (`x` no metafield da discount).
+function excludeOf(t) {
+  const x = (t && t.exclude) || {};
+  return {
+    productIds: (x.productIds || []).map(String),
+    collectionIds: (x.collectionIds || []).map(String),
+    tags: (x.tags || []).map(String).filter(Boolean),
+  };
+}
+
+function hasExclude(x) {
+  return x.productIds.length > 0 || x.collectionIds.length > 0 || x.tags.length > 0;
 }
 
 async function setShopMetafields(admin, metafields) {
@@ -208,34 +272,23 @@ async function cleanupLegacyPage(admin, cursor, dryRun) {
   };
 }
 
-async function loadConfig(admin) {
-  const res = await admin.graphql(
-    `query {
-      shop {
-        id
-        metafield(namespace: "${NS}", key: "${KEY}") { value }
-        live: metafield(namespace: "${NS}", key: "${KEY_LIVE}") { id }
-      }
-    }`
-  );
-  const data = await res.json();
-  const shopId = data.data.shop.id;
-  const raw = data.data.shop.metafield?.value;
-  let bundles = [];
-  try {
-    bundles = raw ? JSON.parse(raw) : [];
-  } catch {
-    bundles = [];
-  }
-  return { shopId, bundles, hasLive: Boolean(data.data.shop.live) };
-}
-
 // Config (fonte da verdade) + `live` (derivado) na mesma mutation.
 async function saveConfig(admin, shopId, bundles) {
   return setShopMetafields(admin, [
     { ownerId: shopId, namespace: NS, key: KEY, type: "json", value: JSON.stringify(bundles) },
     liveMetafield(shopId, bundles),
   ]);
+}
+
+// Guarda os bundles que a operação em massa vai alterar (como estavam antes) em
+// `config_backup`. Uma posição só: a próxima operação sobrescreve. Só os afetados
+// (não o config inteiro), p/ caber no limite de 128 KB. Não é lido pelo tema nem
+// pela function. Retorna { errors, skipped }.
+async function backupBundles(admin, shopId, affected, reason) {
+  const value = JSON.stringify({ savedAt: new Date().toISOString(), reason, partial: true, bundles: affected });
+  if (bytes(value) > LEGACY_MAX_BYTES) return { errors: [], skipped: true };
+  const errs = await setShopMetafields(admin, [{ ownerId: shopId, namespace: NS, key: KEY_BACKUP, type: "json", value }]);
+  return { errors: errs.map((e) => e.message), skipped: false };
 }
 
 async function findBundlesFunction(admin) {
@@ -281,12 +334,15 @@ function buildDiscountConfig(bundles) {
     const t = b.targets || {};
     if (t.type === "collections") for (const id of t.collectionIds || []) collGids.add(`gid://shopify/Collection/${id}`);
     if (t.type === "tags") for (const tag of t.tags || []) tagSet.add(String(tag));
+    const x = excludeOf(t);
+    for (const id of x.collectionIds) collGids.add(`gid://shopify/Collection/${id}`);
+    for (const tag of x.tags) tagSet.add(tag);
   }
   const checkColl = collGids.size <= FN_LIST_MAX;
   const checkTags = tagSet.size <= FN_LIST_MAX;
   const warnings = [];
-  if (!checkColl) warnings.push(`Mais de ${FN_LIST_MAX} collections nos bundles ativos: o checkout não vai validar a collection do produto-gatilho.`);
-  if (!checkTags) warnings.push(`Mais de ${FN_LIST_MAX} tags nos bundles ativos: o checkout não vai validar a tag do produto-gatilho.`);
+  if (!checkColl) warnings.push(`Mais de ${FN_LIST_MAX} collections nos bundles ativos (segmentação + exclusões): o checkout não vai validar a collection do produto-gatilho.`);
+  if (!checkTags) warnings.push(`Mais de ${FN_LIST_MAX} tags nos bundles ativos (segmentação + exclusões): o checkout não vai validar a tag do produto-gatilho.`);
 
   const labels = [];
   const labelIdx = (l) => {
@@ -317,6 +373,12 @@ function buildDiscountConfig(bundles) {
     } else if (t.type === "tags" && checkTags) {
       entry.t = { k: "g", ids: (t.tags || []).map(String) };
     }
+    const x = excludeOf(t);
+    const ex = {};
+    if (x.productIds.length) ex.p = x.productIds.map(Number);
+    if (x.collectionIds.length && checkColl) ex.c = x.collectionIds.map(Number);
+    if (x.tags.length && checkTags) ex.g = x.tags;
+    if (Object.keys(ex).length) entry.x = ex;
     map[b.id] = entry;
   }
 
@@ -330,19 +392,135 @@ function buildDiscountConfig(bundles) {
   const bytes = (v) => new TextEncoder().encode(JSON.stringify(v)).length;
   if (bytes(full) <= DISCOUNT_MAX_BYTES) return { value: JSON.stringify(full), warnings };
 
-  // Grande demais: tira a validação de segmentação (só items).
-  const slim = { v: 2, L: labels, collectionIds: [], tags: [], b: {} };
-  for (const [id, e] of Object.entries(map)) slim.b[id] = e.u ? { i: e.i, u: 1 } : { i: e.i };
-  if (bytes(slim) <= DISCOUNT_MAX_BYTES) {
+  // Grande demais: tira a validação de segmentação (só items). Exclusão por
+  // produto não depende das variables e fica se couber.
+  const slimOf = (keepX) => {
+    const slim = { v: 2, L: labels, collectionIds: [], tags: [], b: {} };
+    for (const [id, e] of Object.entries(map)) {
+      const s = e.u ? { i: e.i, u: 1 } : { i: e.i };
+      if (keepX && e.x?.p) s.x = { p: e.x.p };
+      slim.b[id] = s;
+    }
+    return slim;
+  };
+  for (const keepX of [true, false]) {
+    const slim = slimOf(keepX);
+    if (bytes(slim) > DISCOUNT_MAX_BYTES) continue;
     warnings.push("Config de desconto grande demais para validar a segmentação no checkout (limite de 10 KB da Shopify Function). Os descontos seguem funcionando sem essa validação.");
+    if (!keepX && Object.values(map).some((e) => e.x)) warnings.push("As exclusões também não serão validadas no checkout (só na página do produto).");
+    else if (Object.values(map).some((e) => e.x?.c || e.x?.g)) warnings.push("Exclusões por collection/tag não serão validadas no checkout (só na página do produto); as por produto continuam.");
     return { value: JSON.stringify(slim), warnings };
   }
   return { error: "A config de desconto passou de 10 KB (limite da Shopify Function) — a function não conseguiria ler os descontos. Reduza bundles/add-ons ativos." };
 }
 
+// ── Motor v3 do checkout ────────────────────────────────────────────────────
+// Bundles por produto específico: as regras vão p/ o metafield `brk_bundles.fn` de
+// cada produto-gatilho (pid -> { bundleId: { k, i, u? } }); a config da discount só
+// guarda os bundles amplos (collections/tags/metafield, iguais ao v2) e as chaves
+// (`fnKey`) dos por produto ativos em `a`. Assim ela não cresce com os por produto.
+function buildProductFn(bundles) {
+  const map = new Map();
+  for (const b of bundles) {
+    if (!b.enabled || !isProductBundle(b) || !Number.isInteger(b.fnKey)) continue;
+    const i = {};
+    for (const a of b.addons || []) {
+      const it = {
+        m: V2_MODE[a.mode] || V2_MODE.gift,
+        v: Number(a.value) || 0,
+        l: labelForItem(a),
+        q: Number.isFinite(Number(a.maxQty)) ? Number(a.maxQty) : 1,
+      };
+      if (b.exemption) it.a = 1;
+      i[String(a.productId)] = it;
+    }
+    // h/o: p/ a vitrine (handle do registro e ordem); x: exclusões (iguais ao v2)
+    const entry = { k: b.fnKey, i, h: bundleHandle(b.id), o: orderKey(b) };
+    if (b.limitPerTrigger) entry.u = 1;
+    const ex = excludeOf(b.targets || {});
+    if (hasExclude(ex)) {
+      entry.x = {};
+      if (ex.productIds.length) entry.x.p = ex.productIds.map(Number);
+      if (ex.collectionIds.length) entry.x.c = ex.collectionIds.map(Number);
+      if (ex.tags.length) entry.x.g = ex.tags;
+    }
+    for (const pid of (b.targets?.productIds || []).map(String)) {
+      if (!map.has(pid)) map.set(pid, {});
+      map.get(pid)[b.id] = entry;
+    }
+  }
+  return map;
+}
+
+function buildDiscountConfigV3(bundles) {
+  const broad = bundles.filter((b) => !isProductBundle(b));
+  const built = buildDiscountConfig(broad);
+  if (built.error) return built;
+  const cfg = JSON.parse(built.value);
+  cfg.v = 3;
+  // exclusões dos bundles por produto (no `fn`) também precisam das variables
+  const colls = new Set(cfg.collectionIds);
+  const tags = new Set(cfg.tags);
+  for (const b of bundles) {
+    if (!b.enabled || !isProductBundle(b)) continue;
+    const ex = excludeOf(b.targets || {});
+    for (const id of ex.collectionIds) colls.add(`gid://shopify/Collection/${id}`);
+    for (const t of ex.tags) tags.add(t);
+  }
+  if (colls.size <= FN_LIST_MAX) cfg.collectionIds = [...colls];
+  if (tags.size <= FN_LIST_MAX) cfg.tags = [...tags];
+  cfg.a = bundles.filter((b) => b.enabled && isProductBundle(b) && Number.isInteger(b.fnKey)).map((b) => b.fnKey).sort((x, y) => x - y);
+  const value = JSON.stringify(cfg);
+  if (bytes(value) > DISCOUNT_MAX_BYTES) {
+    return { error: "A config de desconto (v3) passou do limite de 10 KB da Shopify Function — reduza bundles amplos ativos." };
+  }
+  return { value, warnings: built.warnings };
+}
+
+// Verificação do v3 (pura): cada bundle por produto ativo reconstruído a partir dos
+// `fn` dos produtos tem que ser igual à entrada dele no v2 (itens, limite por
+// produto, conjunto de produtos-gatilho) e a chave tem que estar em `a`; os bundles
+// amplos do v3 têm que ser idênticos aos do v2.
+function verifyV3Logic(bundles) {
+  const v2 = buildDiscountConfig(bundles);
+  const v3 = buildDiscountConfigV3(bundles);
+  if (v2.error || v3.error) return { ok: false, problems: [v2.error || v3.error], problemCount: 1 };
+  const c2 = JSON.parse(v2.value);
+  const c3 = JSON.parse(v3.value);
+  const fn = buildProductFn(bundles);
+  const active = new Set(c3.a);
+  const problems = [];
+  for (const [id, e2] of Object.entries(c2.b)) {
+    const b = bundles.find((x) => x.id === id);
+    if (!b) continue;
+    if (!isProductBundle(b)) {
+      // compara com o TEXTO dos labels: a tabela `L` do v3 só tem os labels dos
+      // amplos, então o índice (`l`) muda mesmo com a regra idêntica
+      const withLabels = (e, L) => e && { ...e, i: Object.fromEntries(Object.entries(e.i || {}).map(([k, it]) => [k, { ...it, l: L[it.l] }])) };
+      if (JSON.stringify(withLabels(c3.b[id], c3.L)) !== JSON.stringify(withLabels(e2, c2.L))) problems.push(`${b.name}: regra ampla diferente`);
+      continue;
+    }
+    if (c3.b[id]) problems.push(`${b.name}: por produto ainda na config central`);
+    if (!active.has(b.fnKey)) problems.push(`${b.name}: sem chave ativa`);
+    const pids = [...fn.entries()].filter(([, m]) => m[id]).map(([pid]) => pid).sort();
+    const want = (e2.t?.ids || []).map(String).sort();
+    if (e2.t && JSON.stringify(pids) !== JSON.stringify(want)) problems.push(`${b.name}: produtos-gatilho diferentes`);
+    const e3 = pids.length ? fn.get(pids[0])[id] : null;
+    if (!e3) { problems.push(`${b.name}: sem regra nos produtos`); continue; }
+    const items2 = Object.fromEntries(Object.entries(e2.i).map(([k, it]) => [k, { ...it, l: c2.L[it.l] }]));
+    if (JSON.stringify(e3.i) !== JSON.stringify(items2)) problems.push(`${b.name}: itens diferentes`);
+    if (!!e3.u !== !!e2.u) problems.push(`${b.name}: limite por produto diferente`);
+  }
+  let maxProductBytes = 0;
+  for (const m of fn.values()) maxProductBytes = Math.max(maxProductBytes, bytes(m));
+  if (maxProductBytes > DISCOUNT_MAX_BYTES) problems.push(`Um produto passou de 10 KB de regras (${maxProductBytes} B)`);
+  return { ok: problems.length === 0, problems: problems.slice(0, 10), problemCount: problems.length, v2Bytes: bytes(v2.value), v3Bytes: bytes(v3.value), maxProductBytes, products: fn.size };
+}
+
 // Espelha a config no metafield da discount e cria/atualiza a automatic discount.
-async function syncDiscount(admin, bundles) {
-  const built = buildDiscountConfig(bundles);
+// `engine` "v3" grava a config v3; "v2"/"dual" a v2 de sempre.
+async function syncDiscount(admin, bundles, engine = "v2") {
+  const built = engine === "v3" ? buildDiscountConfigV3(bundles) : buildDiscountConfig(bundles);
   if (built.error) return { error: built.error };
   const discountMetafieldValue = built.value;
   const configWarning = built.warnings.length ? built.warnings.join(" ") : null;
@@ -406,9 +584,29 @@ async function syncDiscount(admin, bundles) {
   return { warning: configWarning };
 }
 
-// Resolve o conjunto de produtos (gid -> título) que um bundle realmente atinge.
-// Expande collections/tags via API (capado em 250 por collection/tag). metafield
-// não é resolvido (marcado como não verificável).
+// Produtos (gid -> título) de uma collection / tag, capado em 250.
+async function collectionProducts(admin, cid) {
+  const res = await admin.graphql(
+    `query($id: ID!) { collection(id: $id) { products(first: 250) { nodes { id title } pageInfo { hasNextPage } } } }`,
+    { variables: { id: `gid://shopify/Collection/${cid}` } }
+  );
+  const c = (await res.json()).data.collection;
+  if (!c) return { nodes: [], truncated: false };
+  return { nodes: c.products.nodes, truncated: c.products.pageInfo.hasNextPage };
+}
+
+async function tagProducts(admin, tag) {
+  const res = await admin.graphql(
+    `query($q: String!) { products(first: 250, query: $q) { nodes { id title } pageInfo { hasNextPage } } }`,
+    { variables: { q: `tag:'${String(tag).replace(/'/g, "")}'` } }
+  );
+  const ps = (await res.json()).data.products;
+  return { nodes: ps.nodes, truncated: ps.pageInfo.hasNextPage };
+}
+
+// Resolve o conjunto de produtos (gid -> título) que um bundle realmente atinge,
+// já sem as exclusões. Expande collections/tags via API (capado em 250 por
+// collection/tag). metafield não é resolvido (marcado como não verificável).
 async function resolveBundleProducts(admin, b) {
   const t = b.targets || {};
   const set = new Map();
@@ -421,27 +619,31 @@ async function resolveBundleProducts(admin, b) {
     }
   } else if (t.type === "collections") {
     for (const cid of t.collectionIds || []) {
-      const res = await admin.graphql(
-        `query($id: ID!) { collection(id: $id) { products(first: 250) { nodes { id title } pageInfo { hasNextPage } } } }`,
-        { variables: { id: `gid://shopify/Collection/${cid}` } }
-      );
-      const c = (await res.json()).data.collection;
-      if (!c) continue;
-      for (const n of c.products.nodes) set.set(n.id, n.title);
-      if (c.products.pageInfo.hasNextPage) truncated = true;
+      const r = await collectionProducts(admin, cid);
+      for (const n of r.nodes) set.set(n.id, n.title);
+      if (r.truncated) truncated = true;
     }
   } else if (t.type === "tags") {
     for (const tag of t.tags || []) {
-      const res = await admin.graphql(
-        `query($q: String!) { products(first: 250, query: $q) { nodes { id title } pageInfo { hasNextPage } } }`,
-        { variables: { q: `tag:'${String(tag).replace(/'/g, "")}'` } }
-      );
-      const ps = (await res.json()).data.products;
-      for (const n of ps.nodes) set.set(n.id, n.title);
-      if (ps.pageInfo.hasNextPage) truncated = true;
+      const r = await tagProducts(admin, tag);
+      for (const n of r.nodes) set.set(n.id, n.title);
+      if (r.truncated) truncated = true;
     }
   } else {
     return { set, truncated: false, unresolved: true };
+  }
+
+  const x = excludeOf(t);
+  for (const id of x.productIds) set.delete(`gid://shopify/Product/${id}`);
+  for (const cid of x.collectionIds) {
+    const r = await collectionProducts(admin, cid);
+    for (const n of r.nodes) set.delete(n.id);
+    if (r.truncated) truncated = true;
+  }
+  for (const tag of x.tags) {
+    const r = await tagProducts(admin, tag);
+    for (const n of r.nodes) set.delete(n.id);
+    if (r.truncated) truncated = true;
   }
   return { set, truncated, unresolved: false };
 }
@@ -454,24 +656,136 @@ function rangeToIso(start, end) {
   };
 }
 
-// Grava config (fonte da verdade) + `live` + espelha a discount. Poucas
-// chamadas fixas, independente do tamanho das collections (sem índice por produto).
-async function persist(admin, shopId, bundles) {
-  const errs = await saveConfig(admin, shopId, bundles);
-  if (errs.length) return { error: errs.map((e) => e.message).join(", ") };
-  const sync = await syncDiscount(admin, bundles);
+// Grava a fonte da verdade + `live` + espelha a discount. `st` vem de loadBundles
+// (ver os modos em bundles-store.server.js):
+//   legacy       → config + live (como sempre foi);
+//   dual         → config + live, depois copia o que mudou p/ os metaobjects;
+//   metaobjects  → metaobjects primeiro; depois live + config antigo (só enquanto
+//                  couber, p/ o rollback continuar possível).
+// `live` e a discount saem das mesmas funções em todos os modos.
+async function persist(admin, st, bundles) {
+  const warnings = [];
+  const fnOn = st.engine === "dual" || st.engine === "v3";
+  if (fnOn) assignFnKeys(bundles);
+  for (const b of bundles) {
+    const changed = !st.prev || !st.prev.some((p) => p.id === b.id && JSON.stringify(p.targets) === JSON.stringify(b.targets));
+    if (changed && isProductBundle(b) && (b.targets?.productIds || []).length > PRODUCT_BUNDLE_WARN) {
+      warnings.push(`"${b.name}" tem mais de ${PRODUCT_BUNDLE_WARN} produtos escolhidos um a um: para bundles grandes, segmente por collection ou tag.`);
+    }
+  }
+  const vitrineOn = st.vitrine === "on" || st.vitrine === "prepared";
+  if (st.mode === "metaobjects") {
+    const moErrs = await writeMetaobjectBundles(admin, bundles, st.mo, vitrineOn ? liveItem : null);
+    if (moErrs.length) return { error: moErrs.join(", ") };
+    const metafields = [];
+    const live = JSON.stringify(buildLive(bundles));
+    if (st.vitrine === "on" && bytes(live) > LEGACY_MAX_BYTES) {
+      warnings.push("O `live` antigo passou de 120 KB e não foi atualizado: a vitrine já usa o formato novo; voltar ao antigo não teria as últimas mudanças.");
+    } else {
+      metafields.push({ ownerId: st.shopId, namespace: NS, key: KEY_LIVE, type: "json", value: live });
+    }
+    if (vitrineOn) {
+      metafields.push({ ownerId: st.shopId, namespace: NS, key: KEY_LIVE_INDEX, type: "json", value: JSON.stringify(buildLiveIndex(bundles, st.vitrineMo, st.vitrine === "on")) });
+    }
+    const cfg = JSON.stringify(bundles);
+    if (bytes(cfg) <= LEGACY_MAX_BYTES) metafields.push({ ownerId: st.shopId, namespace: NS, key: KEY, type: "json", value: cfg });
+    else warnings.push("O config antigo passou de 120 KB e não foi atualizado: voltar ao armazenamento antigo não teria as últimas mudanças.");
+    const errs = await setShopMetafields(admin, metafields);
+    if (errs.length) return { error: errs.map((e) => e.message).join(", ") };
+  } else {
+    const errs = await saveConfig(admin, st.shopId, bundles);
+    if (errs.length) return { error: errs.map((e) => e.message).join(", ") };
+    if (st.mode === "dual") {
+      const moErrs = await writeMetaobjectBundles(admin, bundles, st.mo);
+      if (moErrs.length) warnings.push(`Salvo, mas a cópia nos registros novos falhou: ${moErrs.join(", ")}`);
+    }
+  }
+  // Regras dos bundles por produto nos produtos-gatilho (só o que mudou).
+  if (fnOn) {
+    const plan = planProductFnWrites(buildProductFn(st.prev || []), buildProductFn(bundles));
+    if (plan.sets.length + plan.deletes.length > PRODUCT_FN_INLINE_MAX) {
+      warnings.push(`Muitos produtos afetados (${plan.sets.length + plan.deletes.length}): rode "Sincronizar produtos" no painel do checkout.`);
+    } else {
+      const fnErrs = await writeProductFn(admin, plan.sets, plan.deletes);
+      if (fnErrs.length) warnings.push(`Regras nos produtos com erro (rode "Sincronizar produtos"): ${fnErrs.slice(0, 3).join(", ")}`);
+    }
+  }
+  const sync = await syncDiscount(admin, bundles, st.engine);
   if (sync.error) return { error: sync.error };
-  return { warning: sync.warning || null };
+  if (sync.warning) warnings.push(sync.warning);
+  return { warning: warnings.join(" ") || null };
+}
+
+// Verificação da migração: mesmos bundles, mesma ordem, e — o que importa p/ a
+// loja e o checkout — `live` e o config da discount byte a byte iguais.
+function verifyMigration(legacy, moBundles) {
+  const cmp = compareBundles(legacy, moBundles);
+  const liveSame = JSON.stringify(buildLive(legacy)) === JSON.stringify(buildLive(moBundles));
+  const dl = buildDiscountConfig(legacy);
+  const dm = buildDiscountConfig(moBundles);
+  const discountSame = (dl.value || dl.error) === (dm.value || dm.error);
+  const ok = !cmp.missing.length && !cmp.different.length && !cmp.extra.length && cmp.sameOrder && liveSame && discountSame;
+  return {
+    ok, total: legacy.length, migrated: moBundles.length,
+    missingCount: cmp.missing.length, differentCount: cmp.different.length, extraCount: cmp.extra.length,
+    examples: [...cmp.missing, ...cmp.different, ...cmp.extra].slice(0, 8),
+    sameOrder: cmp.sameOrder, liveSame, discountSame,
+  };
 }
 
 // Recria só os dados derivados (`live` + discount) a partir do config atual,
 // sem tocar no config.
-async function regenerateDerived(admin, shopId, bundles) {
+async function regenerateDerived(admin, shopId, bundles, engine = "v2") {
   const errs = await setShopMetafields(admin, [liveMetafield(shopId, bundles)]);
   if (errs.length) return { error: errs.map((e) => e.message).join(", ") };
-  const sync = await syncDiscount(admin, bundles);
+  const sync = await syncDiscount(admin, bundles, engine);
   if (sync.error) return { error: sync.error };
   return { warning: sync.warning || null };
+}
+
+// Verificação da vitrine v2: cada registro com o `storefront` igual ao que o `live`
+// teria; o índice com os bundles amplos certos; o `fn` de cada produto-gatilho igual
+// ao esperado (é dele que o tema tira os bundles por produto).
+async function verifyVitrine(admin, st, bundles) {
+  const problems = [];
+  if (st.mode !== "metaobjects") problems.push("armazenamento novo não está ativo");
+  if (st.engine === "v2") problems.push("motor do checkout não preparado");
+  if (st.vitrine === "off") problems.push("vitrine não preparada (passo 1)");
+  const mo = await listMetaobjectBundles(admin);
+  let wrongRecords = 0;
+  for (const b of bundles) {
+    if (mo.snapSf.get(b.id) !== JSON.stringify(liveItem(b))) wrongRecords++;
+  }
+  if (wrongRecords) problems.push(`${wrongRecords} registro(s) sem o campo da vitrine atualizado`);
+  const expected = buildProductFn(bundles);
+  const stored = await readProductFn(admin, [...expected.keys()]);
+  const wrongProducts = [...expected.entries()].filter(([pid, m]) => JSON.stringify(stored.get(pid)) !== JSON.stringify(m)).length;
+  if (wrongProducts) problems.push(`${wrongProducts} produto(s) sem as regras atualizadas — rode "Sincronizar produtos"`);
+  if (!st.vitrineMo && st.vitrine !== "off") problems.push("índice sem o tipo do registro — rode o passo 1 de novo");
+  const index = buildLiveIndex(bundles, st.vitrineMo, false);
+  return {
+    ok: problems.length === 0,
+    problems,
+    broad: index.b.length,
+    productBundles: bundles.filter((b) => b.enabled && isProductBundle(b)).length,
+    products: expected.size,
+    indexBytes: bytes(index),
+    liveBytes: bytes(buildLive(bundles)),
+  };
+}
+
+// Tamanhos da config do checkout (v2 atual e como ficaria no v3) p/ o painel.
+function engineInfo(mode, bundles) {
+  const v2 = buildDiscountConfig(bundles);
+  const v3 = buildDiscountConfigV3(bundles);
+  return {
+    mode,
+    v2Bytes: v2.value ? bytes(v2.value) : null,
+    v3Bytes: v3.value ? bytes(v3.value) : null,
+    maxBytes: DISCOUNT_MAX_BYTES,
+    productBundles: bundles.filter((b) => b.enabled && isProductBundle(b)).length,
+    broadBundles: bundles.filter((b) => b.enabled && !isProductBundle(b)).length,
+  };
 }
 
 // ── Loader ──────────────────────────────────────────────────────────────────
@@ -481,11 +795,31 @@ export const loader = async ({ request, context }) => {
   const { admin, session } = await shopify.authenticate.admin(request);
 
   await ensureDefinition(admin);
-  const { shopId, bundles, hasLive } = await loadConfig(admin);
+  let st = await loadBundles(admin);
+  // Loja sem nenhum bundle (instalação nova): não há o que migrar, então vai direto ao
+  // formato final — armazenamento novo + checkout v3 + vitrine nova — sem as etapas dos
+  // painéis, mesmo que alguma etapa já tenha sido clicada pela metade. Lojas com
+  // bundles não entram aqui (seguem as etapas, com verificação).
+  const isFinal = st.mode === "metaobjects" && st.engine === "v3" && st.vitrine === "on";
+  if (!isFinal && st.legacy.length === 0) {
+    const mo = await metaobjectFullType(admin);
+    if (mo && (await listMetaobjectBundles(admin)).bundles.length === 0) {
+      const errs = [...(await setMode(admin, st.shopId, "metaobjects")), ...(await setEngine(admin, st.shopId, "v3"))];
+      if (!errs.length) {
+        await setShopMetafields(admin, [
+          { ownerId: st.shopId, namespace: NS, key: KEY_LIVE_INDEX, type: "json", value: JSON.stringify(buildLiveIndex([], mo, true)) },
+          liveMetafield(st.shopId, []),
+        ]);
+        await syncDiscount(admin, [], "v3");
+        st = await loadBundles(admin);
+      }
+    }
+  }
+  const { shopId, bundles, hasLive } = st;
   // Primeira abertura após a migração: gera `live` + discount a partir do config.
   let liveWarning = null;
   if (!hasLive) {
-    const r = await regenerateDerived(admin, shopId, bundles);
+    const r = await regenerateDerived(admin, shopId, bundles, st.engine);
     liveWarning = r.error || r.warning || null;
   }
 
@@ -506,12 +840,30 @@ export const loader = async ({ request, context }) => {
     hasFn: Boolean(fn),
     hasDiscount: Boolean(discount),
     liveWarning,
+    storage: {
+      mode: st.mode,
+      legacyCount: st.legacy.length,
+      migratedCount: st.mo ? st.mo.bundles.length : (await listMetaobjectBundles(admin)).bundles.length,
+      configBytes: bytes(JSON.stringify(bundles)),
+      liveBytes: bytes(JSON.stringify(buildLive(bundles))),
+      maxBytes: SHOPIFY_JSON_MAX,
+    },
+    engine: engineInfo(st.engine, bundles),
+    vitrine: {
+      mode: st.vitrine,
+      storage: st.mode,
+      engine: st.engine,
+      liveBytes: bytes(JSON.stringify(buildLive(bundles))),
+      indexBytes: bytes(buildLiveIndex(bundles, st.vitrineMo, false)),
+      maxBytes: SHOPIFY_JSON_MAX,
+    },
   });
 };
 
 // O loop da limpeza não precisa recarregar o loader a cada página.
 export function shouldRevalidate({ formData, defaultShouldRevalidate }) {
-  if (formData?.get("intent") === "cleanupLegacy") return false;
+  const intent = formData?.get("intent");
+  if (["cleanupLegacy", "migrateBundles", "verifyBundles", "syncProductFn", "scanProductFn", "verifyV3", "verifyVitrine"].includes(intent)) return false;
   return defaultShouldRevalidate;
 }
 
@@ -562,7 +914,9 @@ export const action = async ({ request, context }) => {
     // Enriquecer os produtos escolhidos na segmentação (nome/imagem p/ chips).
     if (intent === "fetchTargetProducts") {
       const ids = JSON.parse(formData.get("ids") || "[]");
-      if (!ids.length) return json({ action: "fetchTargetProducts", products: [] });
+      // "include" (segmentação) ou "exclude" (exclusões): só ecoado p/ o cliente
+      const scope = formData.get("scope") === "exclude" ? "exclude" : "include";
+      if (!ids.length) return json({ action: "fetchTargetProducts", scope, products: [] });
       const res = await admin.graphql(
         `query ($ids: [ID!]!) {
           nodes(ids: $ids) { ... on Product { id title featuredImage { url } } }
@@ -573,7 +927,7 @@ export const action = async ({ request, context }) => {
       const products = (data.data.nodes || [])
         .filter(Boolean)
         .map((p) => ({ id: numericId(p.id), title: p.title, image: p.featuredImage?.url || null }));
-      return json({ action: "fetchTargetProducts", products });
+      return json({ action: "fetchTargetProducts", scope, products });
     }
 
     // Limpeza do índice legado: 1 página por chamada (o cliente faz o loop).
@@ -593,10 +947,124 @@ export const action = async ({ request, context }) => {
       return json({ action: "cleanupLegacy", dryRun, ...page });
     }
 
-    const { shopId, bundles } = await loadConfig(admin);
+    // ── Migração do config (blob) p/ metaobjects ──
+    // migrateBundles: copia 1 página do config antigo (upsert idempotente, mesma ordem).
+    // verifyBundles: confere bundles, ordem e os dados derivados (live + discount).
+    // setBundlesMode: dual/metaobjects só com a verificação ok; legacy = voltar.
+    if (intent === "migrateBundles" || intent === "verifyBundles" || intent === "setBundlesMode") {
+      const st0 = await loadShopState(admin, { withConfig: true });
+      if (intent === "migrateBundles") {
+        if (st0.mode === "metaobjects") return json({ action: "migrateBundles", error: "Já está no armazenamento novo." });
+        const offset = Math.max(0, Number(formData.get("offset")) || 0);
+        const slice = st0.legacy.slice(offset, offset + MIGRATE_PAGE);
+        const errors = await upsertMetaobjectBundles(admin, slice.map((bundle, k) => ({ bundle, position: offset + k })));
+        const next = offset + slice.length;
+        return json({ action: "migrateBundles", total: st0.legacy.length, next, done: next >= st0.legacy.length, errors });
+      }
+      const mo = await listMetaobjectBundles(admin);
+      const report = verifyMigration(st0.legacy, mo.bundles);
+      if (intent === "verifyBundles") return json({ action: "verifyBundles", ...report });
+      const mode = formData.get("mode");
+      if (!["legacy", "dual", "metaobjects"].includes(mode)) return json({ success: false, error: "Modo inválido." });
+      if (mode !== "legacy" && !report.ok) return json({ action: "verifyBundles", ...report });
+      const errs = await setMode(admin, st0.shopId, mode);
+      if (errs.length) return json({ success: false, error: errs.join(", ") });
+      return json({ success: true, action: "setBundlesMode", mode, ...report });
+    }
+
+    const st = await loadBundles(admin);
+    st.prev = JSON.parse(JSON.stringify(st.bundles)); // estado antes da mudança (diff dos produtos)
+    const { shopId, bundles } = st;
+
+    // ── Motor v3 do checkout ──
+    // prepareV3: dá chave (`fnKey`) aos bundles por produto e liga o modo "dual"
+    //   (os saves passam a manter as regras nos produtos); a discount continua v2.
+    // syncProductFn: grava o `fn` de todos os produtos-gatilho (1 página por chamada).
+    // scanProductFn: varre a loja e apaga `fn` que não deveria existir (1 página/chamada).
+    // verifyV3: lógica (pura) + o que está gravado nos produtos == o esperado.
+    // setEngine: v3 só com a verificação ok; v2/dual = voltar.
+    if (intent === "prepareV3") {
+      const assigned = assignFnKeys(bundles);
+      if (assigned.length) {
+        // grava as chaves nos bundles; os produtos são gravados pelo "Sincronizar produtos"
+        const r = await persist(admin, { ...st, engine: "dual", prev: bundles }, bundles);
+        if (r.error) return json({ success: false, error: r.error });
+      }
+      const errs = await setEngine(admin, shopId, "dual");
+      if (errs.length) return json({ success: false, error: errs.join(", ") });
+      return json({ action: "prepareV3", assigned: assigned.length });
+    }
+    if (intent === "syncProductFn") {
+      const offset = Math.max(0, Number(formData.get("offset")) || 0);
+      const all = [...buildProductFn(bundles).entries()].sort(([a], [b]) => a.localeCompare(b));
+      const slice = all.slice(offset, offset + PRODUCT_FN_PAGE);
+      const errors = await writeProductFn(admin, slice.map(([pid, m]) => ({ pid, value: JSON.stringify(m) })), []);
+      const next = offset + slice.length;
+      return json({ action: "syncProductFn", total: all.length, next, done: next >= all.length, errors });
+    }
+    if (intent === "scanProductFn") {
+      const expected = buildProductFn(bundles);
+      const page = await scanProductFnPage(admin, formData.get("cursor") || null);
+      const orphans = [...page.found.keys()].filter((pid) => !expected.has(pid));
+      const errors = orphans.length ? await writeProductFn(admin, [], orphans) : [];
+      return json({ action: "scanProductFn", scanned: page.scanned, orphans: orphans.length, cursor: page.next, done: !page.next, errors });
+    }
+    if (intent === "verifyV3" || intent === "setEngine") {
+      const logic = verifyV3Logic(bundles);
+      const expected = buildProductFn(bundles);
+      const stored = await readProductFn(admin, [...expected.keys()]);
+      const wrong = [...expected.entries()].filter(([pid, m]) => JSON.stringify(stored.get(pid)) !== JSON.stringify(m)).length;
+      const report = { ...logic, storedOk: wrong === 0, wrongProducts: wrong, ok: logic.ok && wrong === 0 && st.engine !== "v2" };
+      if (intent === "verifyV3") return json({ action: "verifyV3", ...report });
+      const engine = formData.get("engine");
+      if (!["v2", "dual", "v3"].includes(engine)) return json({ success: false, error: "Motor inválido." });
+      if (engine === "v3" && !report.ok) return json({ action: "verifyV3", ...report });
+      const errs = await setEngine(admin, shopId, engine);
+      if (errs.length) return json({ success: false, error: errs.join(", ") });
+      const sync = await syncDiscount(admin, bundles, engine);
+      if (sync.error) {
+        await setEngine(admin, shopId, st.engine);
+        return json({ success: false, error: `Desconto não atualizado, motor mantido: ${sync.error}` });
+      }
+      return json({ success: true, action: "setEngine", engine, warning: sync.warning || null, ...report });
+    }
+
+    // ── Vitrine v2 ──
+    // prepareVitrine: grava o campo `storefront` em todos os registros + o índice
+    //   (`on: false`): nada muda na loja ainda. Exige armazenamento novo e o motor do
+    //   checkout preparado (o tema usa o `fn` dos produtos).
+    // verifyVitrine: registros, índice e `fn` dos produtos == o esperado.
+    // setVitrine: on só com a verificação ok; off = volta ao `live`.
+    if (intent === "prepareVitrine") {
+      if (st.mode !== "metaobjects") return json({ success: false, error: "Ative antes o armazenamento novo dos bundles." });
+      if (st.engine === "v2") return json({ success: false, error: "Prepare antes o motor novo do checkout (as regras nos produtos são usadas pela vitrine)." });
+      const mo = await metaobjectFullType(admin);
+      if (!mo) return json({ success: false, error: "Tipo do registro não encontrado: faça o deploy do app (shopify app deploy)." });
+      const moErrs = await writeMetaobjectBundles(admin, bundles, st.mo, liveItem);
+      if (moErrs.length) return json({ success: false, error: moErrs.join(", ") });
+      const on = st.vitrine === "on";
+      const errs = await setShopMetafields(admin, [
+        { ownerId: shopId, namespace: NS, key: KEY_LIVE_INDEX, type: "json", value: JSON.stringify(buildLiveIndex(bundles, mo, on)) },
+      ]);
+      if (errs.length) return json({ success: false, error: errs.map((e) => e.message).join(", ") });
+      return json({ success: true, action: "prepareVitrine" });
+    }
+    if (intent === "verifyVitrine" || intent === "setVitrine") {
+      const report = await verifyVitrine(admin, st, bundles);
+      if (intent === "verifyVitrine") return json({ action: "verifyVitrine", ...report });
+      const on = formData.get("on") === "1";
+      if (on && !report.ok) return json({ action: "verifyVitrine", ...report });
+      const mo = st.vitrineMo || (await metaobjectFullType(admin));
+      const errs = await setShopMetafields(admin, [
+        { ownerId: shopId, namespace: NS, key: KEY_LIVE_INDEX, type: "json", value: JSON.stringify(buildLiveIndex(bundles, mo, on)) },
+        liveMetafield(shopId, bundles), // `live` atualizado: o caminho antigo continua pronto
+      ]);
+      if (errs.length) return json({ success: false, error: errs.map((e) => e.message).join(", ") });
+      return json({ success: true, action: "setVitrine", on, ...report });
+    }
 
     if (intent === "regenerate") {
-      const r = await regenerateDerived(admin, shopId, bundles);
+      const r = await regenerateDerived(admin, shopId, bundles, st.engine);
       if (r.error) return json({ success: false, error: r.error });
       return json({ success: true, action: "regenerate", warning: r.warning });
     }
@@ -613,7 +1081,7 @@ export const action = async ({ request, context }) => {
       if (i >= 0) bundles[i] = bundle;
       else bundles.push(bundle);
 
-      const r = await persist(admin, shopId, bundles);
+      const r = await persist(admin, st, bundles);
       if (r.error) return json({ success: false, error: r.error });
       return json({ success: true, action: "save", warning: r.warning });
     }
@@ -622,7 +1090,7 @@ export const action = async ({ request, context }) => {
       const id = formData.get("id");
       const b = bundles.find((x) => x.id === id);
       if (b) b.enabled = !b.enabled;
-      const r = await persist(admin, shopId, bundles);
+      const r = await persist(admin, st, bundles);
       if (r.error) return json({ success: false, error: r.error });
       return json({ success: true, action: "toggle", warning: r.warning });
     }
@@ -631,9 +1099,35 @@ export const action = async ({ request, context }) => {
       const id = formData.get("id");
       const b = bundles.find((x) => x.id === id);
       if (b) b.exemption = !b.exemption;
-      const r = await persist(admin, shopId, bundles);
+      const r = await persist(admin, st, bundles);
       if (r.error) return json({ success: false, error: r.error });
       return json({ success: true, action: "toggleExemption", warning: r.warning });
+    }
+
+    // Opções em massa: só as chaves de BULK_OPTION_KEYS, só booleanos, só nos
+    // ids enviados. Backup do config antes de gravar.
+    if (intent === "bulkOptions") {
+      const ids = new Set(JSON.parse(formData.get("ids") || "[]"));
+      const patchIn = JSON.parse(formData.get("patch") || "{}");
+      const patch = {};
+      for (const k of BULK_OPTION_KEYS) if (typeof patchIn[k] === "boolean") patch[k] = patchIn[k];
+      if (!ids.size || !Object.keys(patch).length) return json({ success: false, error: "Nada para aplicar." });
+
+      let count = 0;
+      const next = bundles.map((b) => {
+        if (!ids.has(b.id)) return b;
+        const nb = { ...b, ...patch };
+        if (Object.keys(patch).some((k) => !!nb[k] !== !!b[k])) count++;
+        return nb;
+      });
+      if (!count) return json({ success: true, action: "bulkOptions", count: 0, warning: "Nenhum bundle precisou mudar." });
+
+      const backup = await backupBundles(admin, shopId, bundles.filter((b) => ids.has(b.id)), "bulkOptions");
+      if (backup.errors.length) return json({ success: false, error: `Backup falhou, nada foi alterado: ${backup.errors.join(", ")}` });
+      const r = await persist(admin, st, next);
+      if (r.error) return json({ success: false, error: r.error });
+      const warning = [backup.skipped ? "Seleção grande demais para o backup automático (exporte o CSV antes de mudanças em massa)." : null, r.warning].filter(Boolean).join(" ") || null;
+      return json({ success: true, action: "bulkOptions", count, warning });
     }
 
     if (intent === "duplicate") {
@@ -647,7 +1141,7 @@ export const action = async ({ request, context }) => {
         copy.createdAt = new Date().toISOString();
         bundles.push(copy);
       }
-      const r = await persist(admin, shopId, bundles);
+      const r = await persist(admin, st, bundles);
       if (r.error) return json({ success: false, error: r.error });
       return json({ success: true, action: "duplicate", warning: r.warning });
     }
@@ -658,7 +1152,7 @@ export const action = async ({ request, context }) => {
         : JSON.parse(formData.get("ids") || "[]");
       const idSet = new Set(ids);
       const next = bundles.filter((b) => !idSet.has(b.id));
-      const r = await persist(admin, shopId, next);
+      const r = await persist(admin, st, next);
       if (r.error) return json({ success: false, error: r.error });
       return json({ success: true, action: intent, count: ids.length, warning: r.warning });
     }
@@ -803,10 +1297,42 @@ function blankBundle() {
       collectionsMeta: [],
       tags: [],
       metafield: { namespace: "", key: "", value: "" },
+      exclude: blankExclude(), // exclusões: vencem a segmentação (tema + checkout)
     },
     // cada add-on tem seu próprio desconto
     addons: [],
   };
+}
+
+function blankExclude() {
+  return { productIds: [], productsMeta: [], collectionIds: [], collectionsMeta: [], tags: [] };
+}
+
+// Cópia p/ o editor; bundles antigos ganham `targets.exclude` vazio.
+function forEditor(b) {
+  const c = JSON.parse(JSON.stringify(b));
+  c.targets = { ...blankBundle().targets, ...(c.targets || {}) };
+  c.targets.exclude = { ...blankExclude(), ...(c.targets.exclude || {}) };
+  return c;
+}
+
+function excludeCount(b) {
+  const x = b.targets?.exclude || {};
+  return (x.productIds || []).length + (x.collectionIds || []).length + (x.tags || []).length;
+}
+
+// Tags separadas por vírgula, com o texto digitado guardado localmente (dá p/
+// digitar a vírgula e o espaço antes da próxima tag).
+function TagListField({ tags, onChange, ...props }) {
+  const [text, setText] = useState(() => (tags || []).join(", "));
+  return (
+    <TextField
+      {...props}
+      value={text}
+      onChange={(v) => { setText(v); onChange(v.split(",").map((s) => s.trim()).filter(Boolean)); }}
+      autoComplete="off"
+    />
+  );
 }
 
 // defaults de desconto de um add-on recém-selecionado
@@ -823,6 +1349,18 @@ function withItemDefaults(a) {
     preselected: true,
   };
 }
+
+// Ação em massa "Editar opções" (o servidor só aceita estas chaves: BULK_OPTION_KEYS).
+const BULK_OPTIONS = [
+  { key: "exemption", label: "Isenção fiscal" },
+  { key: "hidePrice", label: "Esconder preços dos add-ons" },
+  { key: "showAddonDiscount", label: "Mostrar desconto do add-on no carrinho" },
+];
+const BULK_CHOICES = [
+  { label: "Manter como está", value: "keep" },
+  { label: "Ativar", value: "on" },
+  { label: "Desativar", value: "off" },
+];
 
 const MODE_LABEL = { gift: "Brinde", percent: "% off", fixed: "R$ off" };
 const TARGET_LABEL = { products: "Produtos", collections: "Collections", tags: "Tags", metafield: "Metafield" };
@@ -847,7 +1385,9 @@ function detectConflicts(bundles) {
       if (!t || t !== b.targets?.type || t === "metafield") continue;
       const ka = a.targets?.[keyId[t]] || [];
       const kb = new Set((b.targets?.[keyId[t]] || []).map(String));
-      const overlap = ka.map(String).filter((x) => kb.has(x));
+      // excluído de um dos dois não conflita (mesma lista de exclusão do tipo)
+      const excl = new Set([...(a.targets?.exclude?.[keyId[t]] || []), ...(b.targets?.exclude?.[keyId[t]] || [])].map(String));
+      const overlap = ka.map(String).filter((x) => kb.has(x) && !excl.has(x));
       if (overlap.length === 0) continue;
       let labels = overlap;
       if (metaOf[t]) {
@@ -860,8 +1400,210 @@ function detectConflicts(bundles) {
   return out;
 }
 
+const kb = (n) => `${(n / 1024).toFixed(1).replace(".", ",")} KB`;
+
+// Texto do resultado da verificação da migração.
+function verifyText(r) {
+  if (r.ok) return `Verificação ok: ${r.total} bundle(s) idênticos, mesma ordem; dados da loja e do checkout iguais byte a byte.`;
+  const parts = [];
+  if (r.missingCount) parts.push(`${r.missingCount} faltando`);
+  if (r.differentCount) parts.push(`${r.differentCount} diferente(s)`);
+  if (r.extraCount) parts.push(`${r.extraCount} sobrando`);
+  if (!r.sameOrder) parts.push("ordem diferente");
+  if (!r.liveSame) parts.push("dados da loja (live) diferentes");
+  if (!r.discountSame) parts.push("config do checkout diferente");
+  return `Verificação não bateu: ${parts.join(", ")}${r.examples?.length ? ` (ex.: ${r.examples.join(", ")})` : ""}. Rode a cópia de novo.`;
+}
+
+// Painel do armazenamento dos bundles: tamanho (limite de 128 KB) e a migração
+// p/ metaobjects em etapas (copiar → verificar → gravação dupla → novo), com volta.
+function StoragePanel({ storage, migration, onCopy, verify, onVerify, onMode, busy, result }) {
+  const pct = Math.round((Math.max(storage.configBytes, storage.liveBytes) / storage.maxBytes) * 100);
+  const sizes = `Tamanho: config ${kb(storage.configBytes)} · dados da loja (live) ${kb(storage.liveBytes)} — limite ${kb(storage.maxBytes)} cada (${pct}% do limite).`;
+  const v = verify.data?.action === "verifyBundles" ? verify.data : result?.action === "verifyBundles" ? result : null;
+  const confirmBack = () => {
+    if (window.confirm("Voltar ao armazenamento antigo (config único)? Ele foi mantido atualizado enquanto coube em 120 KB.")) onMode("legacy");
+  };
+  const modeDone = result?.success && result.action === "setBundlesMode";
+
+  if (storage.mode === "metaobjects") {
+    return (
+      <BlockStack gap="200">
+        {modeDone && <Banner tone="success" title="Armazenamento novo ativado: 1 registro por bundle." />}
+        {storage.liveBytes / storage.maxBytes >= 0.8 && (
+          <Banner tone="warning" title="Dados da loja (live) perto do limite">
+            <p>{sizes} O live só inclui bundles ativos; desative os que não usa mais.</p>
+          </Banner>
+        )}
+        <InlineStack gap="200" blockAlign="center">
+          <Text as="span" tone="subdued" variant="bodySm">Armazenamento: 1 registro por bundle (metaobjects). {sizes}</Text>
+          <Button variant="plain" tone="critical" onClick={confirmBack}>Voltar ao armazenamento antigo</Button>
+        </InlineStack>
+      </BlockStack>
+    );
+  }
+
+  const dual = storage.mode === "dual";
+  return (
+    <Banner
+      tone={dual ? "info" : pct >= 80 ? "warning" : "info"}
+      title={dual ? "Gravação dupla ativa (período de teste do armazenamento novo)" : "Armazenamento dos bundles: migrar para 1 registro por bundle"}
+    >
+      <BlockStack gap="200">
+        <Text as="p" variant="bodySm">{sizes}</Text>
+        <Text as="p" variant="bodySm">
+          {dual
+            ? "Tudo continua lendo o formato antigo, e cada alteração também é gravada nos registros novos. Use normalmente por alguns dias; depois verifique e ative o armazenamento novo."
+            : "Hoje todos os bundles ficam num JSON único, que a Shopify só aceita gravar até 128 KB. A migração copia cada bundle para um registro próprio (metaobject). A loja e o checkout não mudam: os dados que eles leem continuam sendo gerados do mesmo jeito, e a verificação confere isso byte a byte."}
+        </Text>
+        {!dual && (
+          <Text as="p" variant="bodySm">
+            {migration
+              ? `Copiando… ${migration.next} de ${migration.total}${migration.running ? "" : " (parado)"}`
+              : `${storage.migratedCount} de ${storage.legacyCount} bundle(s) já copiados.`}
+          </Text>
+        )}
+        {migration?.errors.length > 0 && <Text as="p" variant="bodySm" tone="critical">{migration.errors.slice(0, 5).join(" · ")}</Text>}
+        {v && <Text as="p" variant="bodySm" tone={v.ok ? "success" : "critical"}>{verifyText(v)}</Text>}
+        {modeDone && <Text as="p" variant="bodySm" tone="success">{result.mode === "dual" ? "Gravação dupla ativada." : "Voltou ao armazenamento antigo."}</Text>}
+        <InlineStack gap="200">
+          {!dual && <Button onClick={onCopy} loading={!!migration?.running}>1. Copiar bundles</Button>}
+          <Button onClick={onVerify} loading={verify.state !== "idle"} disabled={!!migration?.running}>{dual ? "Verificar" : "2. Verificar"}</Button>
+          {!dual && (
+            <Button variant="primary" onClick={() => onMode("dual")} loading={busy} disabled={!v?.ok || !!migration?.running}>
+              3. Ativar gravação dupla
+            </Button>
+          )}
+          {dual && (
+            <>
+              <Button variant="primary" onClick={() => onMode("metaobjects")} loading={busy} disabled={!v?.ok}>Ativar armazenamento novo</Button>
+              <Button variant="plain" tone="critical" onClick={() => onMode("legacy")}>Desligar gravação dupla</Button>
+            </>
+          )}
+        </InlineStack>
+      </BlockStack>
+    </Banner>
+  );
+}
+
+// Texto do resultado da verificação do motor v3.
+function verifyV3Text(r) {
+  if (r.ok) return `Verificação ok: ${r.products} produto(s) com as regras certas; checkout ${kb(r.v2Bytes)} → ${kb(r.v3Bytes)}; maior produto ${r.maxProductBytes} B.`;
+  const parts = [];
+  if (r.problemCount) parts.push(`${r.problemCount} problema(s) de regra${r.problems?.length ? ` (ex.: ${r.problems.slice(0, 3).join("; ")})` : ""}`);
+  if (!r.storedOk) parts.push(`${r.wrongProducts} produto(s) sem a regra gravada — rode "Sincronizar produtos"`);
+  if (!parts.length) parts.push('prepare primeiro (passo 1)');
+  return `Verificação não bateu: ${parts.join("; ")}.`;
+}
+
+// Painel do motor do checkout: config do desconto (limite de ~10 KB da Shopify
+// Function) e a troca p/ o v3 (regras dos bundles por produto nos próprios produtos).
+function EnginePanel({ engine, fnSync, onSync, verify, onVerify, onPrepare, onEngine, busy, result }) {
+  const pct = engine.v2Bytes ? Math.round((engine.v2Bytes / engine.maxBytes) * 100) : null;
+  const v = verify.data?.action === "verifyV3" ? verify.data : result?.action === "verifyV3" ? result : null;
+  const done = result?.success && result.action === "setEngine";
+  const syncText = fnSync && (fnSync.phase === "sync"
+    ? `Gravando regras nos produtos… ${fnSync.next} de ${fnSync.total || "?"}${fnSync.running ? "" : " (parado)"}`
+    : fnSync.phase === "scan"
+      ? `Procurando regras antigas na loja… ${fnSync.scanned} produto(s) verificados, ${fnSync.orphans} limpas${fnSync.running ? "" : " (parado)"}`
+      : `Produtos sincronizados: ${fnSync.total} com regra; ${fnSync.orphans} regra(s) antiga(s) limpa(s) em ${fnSync.scanned} produto(s).`);
+
+  if (engine.mode === "v3") {
+    return (
+      <BlockStack gap="200">
+        {done && <Banner tone="success" title="Motor novo do checkout ativado." />}
+        <InlineStack gap="200" blockAlign="center">
+          <Text as="span" tone="subdued" variant="bodySm">
+            Checkout: motor novo — {kb(engine.v3Bytes || 0)} de {kb(engine.maxBytes)} ({engine.broadBundles} bundle(s) amplo(s) na config; {engine.productBundles} por produto ficam nos próprios produtos).
+          </Text>
+          <Button variant="plain" onClick={onSync} loading={!!fnSync?.running}>Sincronizar produtos</Button>
+          <Button variant="plain" tone="critical" onClick={() => { if (window.confirm("Voltar ao motor antigo do checkout? Todas as regras voltam para a config do desconto.")) onEngine("dual"); }}>Voltar ao motor antigo</Button>
+        </InlineStack>
+        {syncText && <Text as="p" variant="bodySm">{syncText}</Text>}
+        {fnSync?.errors.length > 0 && <Text as="p" variant="bodySm" tone="critical">{fnSync.errors.slice(0, 5).join(" · ")}</Text>}
+      </BlockStack>
+    );
+  }
+
+  const dual = engine.mode === "dual";
+  return (
+    <Banner
+      tone={pct != null && pct >= 80 ? "warning" : "info"}
+      title={dual ? "Checkout: preparando o motor novo" : "Checkout: config do desconto dos bundles"}
+    >
+      <BlockStack gap="200">
+        <Text as="p" variant="bodySm">
+          Tamanho: {engine.v2Bytes != null ? `${kb(engine.v2Bytes)} de ${kb(engine.maxBytes)} (${pct}%)` : "passou do limite (modo resumido)"}. Com o motor novo: {engine.v3Bytes != null ? kb(engine.v3Bytes) : "—"}.
+        </Text>
+        <Text as="p" variant="bodySm">
+          A Shopify só entrega ~10 KB de config à regra de desconto. No motor novo, as regras dos {engine.productBundles} bundle(s) por produto ficam gravadas nos próprios produtos-gatilho, e a config guarda só os {engine.broadBundles} bundle(s) amplo(s) (por collection/tag). Os descontos são os mesmos; a verificação confere regra por regra antes de ativar.
+        </Text>
+        {syncText && <Text as="p" variant="bodySm">{syncText}</Text>}
+        {fnSync?.errors.length > 0 && <Text as="p" variant="bodySm" tone="critical">{fnSync.errors.slice(0, 5).join(" · ")}</Text>}
+        {v && <Text as="p" variant="bodySm" tone={v.ok ? "success" : "critical"}>{verifyV3Text(v)}</Text>}
+        {done && <Text as="p" variant="bodySm" tone="success">{result.engine === "dual" ? "Motor antigo ativo (regras continuam sendo mantidas nos produtos)." : "Motor antigo ativo."}</Text>}
+        <InlineStack gap="200">
+          {!dual && <Button onClick={onPrepare} loading={busy}>1. Preparar</Button>}
+          {dual && (
+            <>
+              <Button onClick={onSync} loading={!!fnSync?.running}>2. Sincronizar produtos</Button>
+              <Button onClick={onVerify} loading={verify.state !== "idle"} disabled={!!fnSync?.running}>3. Verificar</Button>
+              <Button variant="primary" onClick={() => onEngine("v3")} loading={busy} disabled={!v?.ok || !!fnSync?.running}>4. Ativar motor novo</Button>
+              <Button variant="plain" tone="critical" onClick={() => onEngine("v2")}>Cancelar preparação</Button>
+            </>
+          )}
+        </InlineStack>
+      </BlockStack>
+    </Banner>
+  );
+}
+
+// Painel da vitrine (página do produto + carrinho): sai do `live` (JSON único com
+// todos os bundles, limite de 128 KB) p/ índice pequeno + registro de cada bundle.
+function VitrinePanel({ vitrine, verify, onVerify, onPrepare, onSet, busy, result }) {
+  const pct = Math.round((vitrine.liveBytes / vitrine.maxBytes) * 100);
+  const v = verify.data?.action === "verifyVitrine" ? verify.data : result?.action === "verifyVitrine" ? result : null;
+  const done = result?.success && result.action === "setVitrine";
+  const blocked = vitrine.storage !== "metaobjects" ? "Primeiro ative o armazenamento novo dos bundles (painel acima)."
+    : vitrine.engine === "v2" ? 'Primeiro faça o "1. Preparar" e o "2. Sincronizar produtos" do checkout (a vitrine usa as regras gravadas nos produtos).' : null;
+  const verifyText = v && (v.ok
+    ? `Verificação ok: ${v.productBundles} bundle(s) por produto em ${v.products} produto(s), ${v.broad} amplo(s) no índice (${kb(v.indexBytes)}).`
+    : `Verificação não bateu: ${v.problems.join("; ")}.`);
+
+  if (vitrine.mode === "on") {
+    return (
+      <BlockStack gap="200">
+        {done && <Banner tone="success" title="Vitrine nova ativada." />}
+        <InlineStack gap="200" blockAlign="center">
+          <Text as="span" tone="subdued" variant="bodySm">
+            Vitrine: formato novo — índice {kb(vitrine.indexBytes)} (só bundles amplos); detalhes no registro de cada bundle. O `live` antigo ({kb(vitrine.liveBytes)}) segue atualizado enquanto couber, p/ poder voltar.
+          </Text>
+          <Button variant="plain" tone="critical" onClick={() => { if (window.confirm("Voltar a vitrine para o formato antigo (live)?")) onSet(false); }}>Voltar ao formato antigo</Button>
+        </InlineStack>
+      </BlockStack>
+    );
+  }
+  return (
+    <Banner tone={pct >= 80 ? "warning" : "info"} title={vitrine.mode === "prepared" ? "Vitrine: formato novo preparado (ainda não ativo)" : "Vitrine: dados da página do produto e do carrinho"}>
+      <BlockStack gap="200">
+        <Text as="p" variant="bodySm">
+          Hoje o tema lê o `live`: {kb(vitrine.liveBytes)} de {kb(vitrine.maxBytes)} ({pct}%). No formato novo ele lê só um índice dos bundles amplos ({kb(vitrine.indexBytes)}), as regras de cada produto e o registro de cada bundle — nada cresce com o total de bundles. O visual e o comportamento são os mesmos.
+        </Text>
+        {blocked && <Text as="p" variant="bodySm" tone="caution">{blocked}</Text>}
+        {verifyText && <Text as="p" variant="bodySm" tone={v.ok ? "success" : "critical"}>{verifyText}</Text>}
+        {done && !result.on && <Text as="p" variant="bodySm" tone="success">Vitrine de volta ao formato antigo.</Text>}
+        <InlineStack gap="200">
+          <Button onClick={onPrepare} loading={busy} disabled={!!blocked}>{vitrine.mode === "prepared" ? "1. Preparar de novo" : "1. Preparar"}</Button>
+          <Button onClick={onVerify} loading={verify.state !== "idle"} disabled={!!blocked || vitrine.mode === "off"}>2. Verificar</Button>
+          <Button variant="primary" onClick={() => onSet(true)} loading={busy} disabled={!v?.ok}>3. Ativar vitrine nova</Button>
+        </InlineStack>
+      </BlockStack>
+    </Banner>
+  );
+}
+
 export default function Bundles() {
-  const { bundles, stats, start, end, hasFn, hasDiscount, liveWarning } = useLoaderData();
+  const { bundles, stats, start, end, hasFn, hasDiscount, liveWarning, storage, engine, vitrine } = useLoaderData();
   const actionData = useActionData();
   const submit = useSubmit();
   const navigation = useNavigation();
@@ -871,6 +1613,60 @@ export default function Bundles() {
   const saveFetcher = useFetcher();
   const conflictFetcher = useFetcher();
   const cleanupFetcher = useFetcher();
+  const migrateFetcher = useFetcher();
+  const verifyFetcher = useFetcher();
+  const fnFetcher = useFetcher();
+  const verifyV3Fetcher = useFetcher();
+  const verifyVitrineFetcher = useFetcher();
+
+  // ── Motor v3: sincronizar regras nos produtos (grava todos, depois varre órfãos) ──
+  const [fnSync, setFnSync] = useState(null); // { phase, running, next, total, scanned, orphans, errors }
+  const startFnSync = useCallback(() => {
+    setFnSync({ phase: "sync", running: true, next: 0, total: 0, scanned: 0, orphans: 0, errors: [] });
+    fnFetcher.submit({ intent: "syncProductFn", offset: "0" }, { method: "post" });
+  }, [fnFetcher]);
+  const lastFn = useRef(null);
+  useEffect(() => {
+    const d = fnFetcher.data;
+    if (!d || d === lastFn.current) return;
+    lastFn.current = d;
+    if (d.action !== "syncProductFn" && d.action !== "scanProductFn") {
+      setFnSync((cur) => cur && { ...cur, running: false, errors: [...cur.errors, d.error || "Erro desconhecido."] });
+      return;
+    }
+    const errors = d.errors || [];
+    if (d.action === "syncProductFn") {
+      const toScan = d.done && errors.length === 0;
+      setFnSync((cur) => cur && { ...cur, next: d.next, total: d.total, errors: [...cur.errors, ...errors], phase: toScan ? "scan" : "sync", running: errors.length === 0 });
+      if (errors.length) return;
+      if (!d.done) fnFetcher.submit({ intent: "syncProductFn", offset: String(d.next) }, { method: "post" });
+      else fnFetcher.submit({ intent: "scanProductFn", cursor: "" }, { method: "post" });
+      return;
+    }
+    const keepGoing = !d.done && errors.length === 0;
+    setFnSync((cur) => cur && { ...cur, scanned: cur.scanned + d.scanned, orphans: cur.orphans + d.orphans, errors: [...cur.errors, ...errors], phase: keepGoing ? "scan" : "done", running: keepGoing });
+    if (keepGoing) fnFetcher.submit({ intent: "scanProductFn", cursor: d.cursor }, { method: "post" });
+  }, [fnFetcher.data, fnFetcher]);
+
+  // ── Migração do armazenamento (loop página a página pelo cliente) ──
+  const [migration, setMigration] = useState(null); // { running, next, total, errors }
+  const startMigration = useCallback(() => {
+    setMigration({ running: true, next: 0, total: storage.legacyCount, errors: [] });
+    migrateFetcher.submit({ intent: "migrateBundles", offset: "0" }, { method: "post" });
+  }, [migrateFetcher, storage.legacyCount]);
+  const lastMigrate = useRef(null);
+  useEffect(() => {
+    const d = migrateFetcher.data;
+    if (!d || d === lastMigrate.current) return;
+    lastMigrate.current = d;
+    if (d.action !== "migrateBundles" || d.error) {
+      setMigration((cur) => cur && { ...cur, running: false, errors: [...cur.errors, d.error || "Erro desconhecido."] });
+      return;
+    }
+    const keepGoing = !d.done && d.errors.length === 0;
+    setMigration((cur) => cur && { ...cur, next: d.next, total: d.total, errors: [...cur.errors, ...d.errors], running: keepGoing });
+    if (keepGoing) migrateFetcher.submit({ intent: "migrateBundles", offset: String(d.next) }, { method: "post" });
+  }, [migrateFetcher.data, migrateFetcher]);
   const [searchParams, setSearchParams] = useSearchParams();
 
   // ── Limpeza do índice legado (loop página a página pelo cliente) ──
@@ -907,34 +1703,42 @@ export default function Bundles() {
   const [savedOk, setSavedOk] = useState(false);
 
   const startNew = useCallback(() => { setSavedOk(false); setEditing(blankBundle()); }, []);
-  const startEdit = useCallback((b) => { setSavedOk(false); setEditing(JSON.parse(JSON.stringify(b))); }, []);
+  const startEdit = useCallback((b) => { setSavedOk(false); setEditing(forEditor(b)); }, []);
   const cancel = useCallback(() => { setSavedOk(false); setEditing(null); }, []);
   const setField = useCallback((field, val) => setEditing((cur) => ({ ...cur, [field]: val })), []);
   const setTarget = useCallback((field, val) =>
     setEditing((cur) => ({ ...cur, targets: { ...cur.targets, [field]: val } })), []);
+  const setExclude = useCallback((field, val) =>
+    setEditing((cur) => ({ ...cur, targets: { ...cur.targets, exclude: { ...cur.targets.exclude, [field]: val } } })), []);
 
   // ── Pickers ──
-  const pickProducts = useCallback(async () => {
-    const selectionIds = (editing?.targets?.productsMeta || []).map((p) => ({ id: `gid://shopify/Product/${p.id}` }));
+  // scope "include" = segmentação; "exclude" = exclusões (targets.exclude)
+  const pickProducts = useCallback(async (scope = "include") => {
+    const src = scope === "exclude" ? editing?.targets?.exclude : editing?.targets;
+    const selectionIds = (src?.productsMeta || []).map((p) => ({ id: `gid://shopify/Product/${p.id}` }));
     const picked = await shopify.resourcePicker({ type: "product", multiple: true, selectionIds });
     if (!picked) return;
     const fd = new FormData();
     fd.set("intent", "fetchTargetProducts");
+    fd.set("scope", scope);
     fd.set("ids", JSON.stringify(picked.map((p) => p.id)));
     targetFetcher.submit(fd, { method: "post" });
   }, [shopify, targetFetcher, editing]);
 
-  const pickCollections = useCallback(async () => {
-    const selectionIds = (editing?.targets?.collectionsMeta || []).map((c) => ({ id: `gid://shopify/Collection/${c.id}` }));
+  const pickCollections = useCallback(async (scope = "include") => {
+    const src = scope === "exclude" ? editing?.targets?.exclude : editing?.targets;
+    const selectionIds = (src?.collectionsMeta || []).map((c) => ({ id: `gid://shopify/Collection/${c.id}` }));
     const picked = await shopify.resourcePicker({ type: "collection", multiple: true, selectionIds });
     if (!picked) return;
+    const next = {
+      collectionIds: picked.map((c) => numericId(c.id)),
+      collectionsMeta: picked.map((c) => ({ id: numericId(c.id), title: c.title, image: c.image?.originalSrc || c.image?.src || null })),
+    };
     setEditing((cur) => ({
       ...cur,
-      targets: {
-        ...cur.targets,
-        collectionIds: picked.map((c) => numericId(c.id)),
-        collectionsMeta: picked.map((c) => ({ id: numericId(c.id), title: c.title, image: c.image?.originalSrc || c.image?.src || null })),
-      },
+      targets: scope === "exclude"
+        ? { ...cur.targets, exclude: { ...cur.targets.exclude, ...next } }
+        : { ...cur.targets, ...next },
     }));
   }, [shopify, editing]);
 
@@ -970,9 +1774,16 @@ export default function Bundles() {
   const lastTarget = useRef(null);
   if (targetFetcher.data?.action === "fetchTargetProducts" && targetFetcher.data !== lastTarget.current && editing) {
     lastTarget.current = targetFetcher.data;
+    const next = { productIds: targetFetcher.data.products.map((p) => p.id), productsMeta: targetFetcher.data.products };
+    const toExclude = targetFetcher.data.scope === "exclude";
     setEditing((cur) =>
       cur
-        ? { ...cur, targets: { ...cur.targets, productIds: targetFetcher.data.products.map((p) => p.id), productsMeta: targetFetcher.data.products } }
+        ? {
+            ...cur,
+            targets: toExclude
+              ? { ...cur.targets, exclude: { ...cur.targets.exclude, ...next } }
+              : { ...cur.targets, ...next },
+          }
         : cur
     );
   }
@@ -1004,6 +1815,23 @@ export default function Bundles() {
         productsMeta: (cur.targets.productsMeta || []).filter((p) => p.id !== id),
       },
     }));
+  }, []);
+  const removeExcluded = useCallback((field, id) => {
+    const meta = field === "productIds" ? "productsMeta" : "collectionsMeta";
+    setEditing((cur) => {
+      const x = cur.targets.exclude;
+      return {
+        ...cur,
+        targets: {
+          ...cur.targets,
+          exclude: {
+            ...x,
+            [field]: (x[field] || []).filter((v) => String(v) !== String(id)),
+            [meta]: (x[meta] || []).filter((m) => String(m.id) !== String(id)),
+          },
+        },
+      };
+    });
   }, []);
 
   const handleSave = useCallback(() => {
@@ -1075,6 +1903,42 @@ export default function Bundles() {
     exportBundlesCSV(bundles.filter((b) => set.has(b.id)), stats, "brk-bundles-selecionados.csv");
   }, [selectedResources, bundles, stats]);
 
+  // ── Opções em massa (ação "Editar opções" dos selecionados) ──
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkChoice, setBulkChoice] = useState({}); // key -> "keep" | "on" | "off"
+  const openBulk = useCallback(() => { setBulkChoice({}); setBulkOpen(true); }, []);
+  const bulkSelected = useMemo(() => {
+    const set = new Set(selectedResources);
+    return bundles.filter((b) => set.has(b.id));
+  }, [selectedResources, bundles]);
+  const bulkPreview = useMemo(() => {
+    const patch = {};
+    for (const o of BULK_OPTIONS) {
+      if (bulkChoice[o.key] === "on") patch[o.key] = true;
+      else if (bulkChoice[o.key] === "off") patch[o.key] = false;
+    }
+    const perKey = {};
+    const changed = new Set();
+    let showWithoutExemption = 0;
+    for (const b of bulkSelected) {
+      for (const k of Object.keys(patch)) {
+        if (!!b[k] !== patch[k]) {
+          perKey[k] = (perKey[k] || 0) + 1;
+          changed.add(b.id);
+        }
+      }
+      const after = { ...b, ...patch };
+      if (after.showAddonDiscount && !after.exemption) showWithoutExemption++;
+    }
+    const touchesShow = "showAddonDiscount" in patch || "exemption" in patch;
+    return { patch, perKey, changed: changed.size, showWithoutExemption: touchesShow ? showWithoutExemption : 0 };
+  }, [bulkChoice, bulkSelected]);
+  const applyBulk = useCallback(() => {
+    runIntent("bulkOptions", { ids: JSON.stringify(selectedResources), patch: JSON.stringify(bulkPreview.patch) });
+    setBulkOpen(false);
+    clearSelection();
+  }, [runIntent, selectedResources, bulkPreview, clearSelection]);
+
   const fetchingAddons = addonFetcher.state !== "idle";
   const fetchingTargets = targetFetcher.state !== "idle";
 
@@ -1117,7 +1981,7 @@ export default function Bundles() {
                     <BlockStack gap="300">
                       <InlineStack align="space-between" blockAlign="center">
                         <Text as="span" tone="subdued" variant="bodySm">{b.targets.productIds.length} produto(s)</Text>
-                        <Button onClick={pickProducts} loading={fetchingTargets}>Selecionar produtos</Button>
+                        <Button onClick={() => pickProducts("include")} loading={fetchingTargets}>Selecionar produtos</Button>
                       </InlineStack>
                       <BlockStack gap="200">
                         {(b.targets.productsMeta || []).map((p) => (
@@ -1136,7 +2000,7 @@ export default function Bundles() {
                     <BlockStack gap="300">
                       <InlineStack align="space-between" blockAlign="center">
                         <Text as="span" tone="subdued" variant="bodySm">{b.targets.collectionIds.length} collection(s)</Text>
-                        <Button onClick={pickCollections}>Selecionar collections</Button>
+                        <Button onClick={() => pickCollections("include")}>Selecionar collections</Button>
                       </InlineStack>
                       <InlineStack gap="200" wrap>
                         {(b.targets.collectionsMeta || []).map((c) => (
@@ -1164,6 +2028,55 @@ export default function Bundles() {
                       <Box minWidth="160px"><TextField label="Valor (opcional)" value={b.targets.metafield?.value || ""} onChange={(v) => setTarget("metafield", { ...b.targets.metafield, value: v })} autoComplete="off" placeholder="vazio = só existir" /></Box>
                     </InlineStack>
                   )}
+
+                  <Divider />
+                  <BlockStack gap="300">
+                    <BlockStack gap="100">
+                      <Text as="h3" variant="headingSm">Excluir (não aparece em)</Text>
+                      <Text as="p" tone="subdued" variant="bodySm">
+                        Produtos que caem em qualquer exclusão abaixo não recebem este bundle, mesmo estando na segmentação acima. Vale na página do produto e no checkout. Use para separar produtos que vão ter um bundle próprio.
+                      </Text>
+                    </BlockStack>
+
+                    <InlineStack align="space-between" blockAlign="center">
+                      <Text as="span" tone="subdued" variant="bodySm">{b.targets.exclude.productIds.length} produto(s) excluído(s)</Text>
+                      <Button onClick={() => pickProducts("exclude")} loading={fetchingTargets}>Selecionar produtos a excluir</Button>
+                    </InlineStack>
+                    {(b.targets.exclude.productsMeta || []).length > 0 && (
+                      <BlockStack gap="200">
+                        {b.targets.exclude.productsMeta.map((p) => (
+                          <Box key={p.id} padding="200" borderWidth="025" borderColor="border" borderRadius="200">
+                            <InlineStack gap="300" blockAlign="center">
+                              {p.image && <Thumbnail source={p.image} alt={p.title} size="small" />}
+                              <Box width="100%"><Text as="span" variant="bodyMd">{p.title}</Text></Box>
+                              <Button variant="plain" tone="critical" onClick={() => removeExcluded("productIds", p.id)}>Remover</Button>
+                            </InlineStack>
+                          </Box>
+                        ))}
+                      </BlockStack>
+                    )}
+
+                    <InlineStack align="space-between" blockAlign="center">
+                      <Text as="span" tone="subdued" variant="bodySm">{b.targets.exclude.collectionIds.length} collection(s) excluída(s)</Text>
+                      <Button onClick={() => pickCollections("exclude")}>Selecionar collections a excluir</Button>
+                    </InlineStack>
+                    {(b.targets.exclude.collectionsMeta || []).length > 0 && (
+                      <InlineStack gap="200" wrap>
+                        {b.targets.exclude.collectionsMeta.map((c) => (
+                          <Tag key={c.id} onRemove={() => removeExcluded("collectionIds", c.id)}>{c.title}</Tag>
+                        ))}
+                      </InlineStack>
+                    )}
+
+                    <TagListField
+                      key={`${b.id}-exclude-tags`}
+                      label="Tags a excluir (separadas por vírgula)"
+                      tags={b.targets.exclude.tags}
+                      onChange={(v) => setExclude("tags", v)}
+                      placeholder="ex: halloween"
+                      helpText="Na página do produto, a collection excluída precisa estar publicada na Loja Online (igual à segmentação)."
+                    />
+                  </BlockStack>
                 </BlockStack>
               </Card>
 
@@ -1343,6 +2256,36 @@ export default function Bundles() {
       ]}
     >
       <BlockStack gap="400">
+        <StoragePanel
+          storage={storage}
+          migration={migration}
+          onCopy={startMigration}
+          verify={verifyFetcher}
+          onVerify={() => verifyFetcher.submit({ intent: "verifyBundles" }, { method: "post" })}
+          onMode={(mode) => runIntent("setBundlesMode", { mode })}
+          busy={isSubmitting && navigation.formData?.get("intent") === "setBundlesMode"}
+          result={actionData}
+        />
+        <EnginePanel
+          engine={engine}
+          fnSync={fnSync}
+          onSync={startFnSync}
+          verify={verifyV3Fetcher}
+          onVerify={() => verifyV3Fetcher.submit({ intent: "verifyV3" }, { method: "post" })}
+          onPrepare={() => runIntent("prepareV3")}
+          onEngine={(e) => runIntent("setEngine", { engine: e })}
+          busy={isSubmitting && ["prepareV3", "setEngine"].includes(navigation.formData?.get("intent"))}
+          result={actionData}
+        />
+        <VitrinePanel
+          vitrine={vitrine}
+          verify={verifyVitrineFetcher}
+          onVerify={() => verifyVitrineFetcher.submit({ intent: "verifyVitrine" }, { method: "post" })}
+          onPrepare={() => runIntent("prepareVitrine")}
+          onSet={(on) => runIntent("setVitrine", { on: on ? "1" : "0" })}
+          busy={isSubmitting && ["prepareVitrine", "setVitrine"].includes(navigation.formData?.get("intent"))}
+          result={actionData}
+        />
         {liveWarning && (
           <Banner tone="warning" title="Dados ao vivo gerados com aviso"><p>{liveWarning}</p></Banner>
         )}
@@ -1382,7 +2325,10 @@ export default function Bundles() {
           <Banner tone="warning"><p>{actionData.warning}</p></Banner>
         )}
         {actionData?.success && !actionData.warning && (
-          <Banner tone="success" title="Feito!" />
+          <Banner
+            tone="success"
+            title={actionData.action === "bulkOptions" ? `Opções aplicadas em ${actionData.count} bundle(s)` : "Feito!"}
+          />
         )}
         {actionData?.error && <Banner tone="critical" title="Erro"><p>{actionData.error}</p></Banner>}
 
@@ -1476,6 +2422,7 @@ export default function Bundles() {
               onSelectionChange={handleSelectionChange}
               bulkActions={[
                 { content: "Exportar selecionados", onAction: handleExportSelected },
+                { content: "Editar opções", onAction: openBulk },
                 { content: "Excluir selecionados", destructive: true, onAction: () => runIntent("deleteMany", { ids: JSON.stringify(selectedResources) }) },
               ]}
               headings={[
@@ -1508,7 +2455,12 @@ export default function Bundles() {
                         </BlockStack>
                       </InlineStack>
                     </IndexTable.Cell>
-                    <IndexTable.Cell><Tag>{TARGET_LABEL[b.targets?.type] || b.targets?.type}</Tag></IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <InlineStack gap="100" blockAlign="center" wrap={false}>
+                        <Tag>{TARGET_LABEL[b.targets?.type] || b.targets?.type}</Tag>
+                        {excludeCount(b) > 0 && <Badge tone="attention">{`− ${excludeCount(b)} exclusão(ões)`}</Badge>}
+                      </InlineStack>
+                    </IndexTable.Cell>
                     <IndexTable.Cell>{typeSummary(b)}</IndexTable.Cell>
                     <IndexTable.Cell>
                       {(b.orderTags || []).length ? (
@@ -1540,6 +2492,49 @@ export default function Bundles() {
           </Card>
         )}
       </BlockStack>
+
+      {bulkOpen && (
+        <Modal
+          open
+          onClose={() => setBulkOpen(false)}
+          title={`Editar opções de ${bulkSelected.length} bundle(s)`}
+          primaryAction={{
+            content: bulkPreview.changed ? `Aplicar em ${bulkPreview.changed} bundle(s)` : "Aplicar",
+            onAction: applyBulk,
+            disabled: bulkPreview.changed === 0,
+          }}
+          secondaryActions={[{ content: "Cancelar", onAction: () => setBulkOpen(false) }]}
+        >
+          <Modal.Section>
+            <BlockStack gap="400">
+              {BULK_OPTIONS.map((o) => (
+                <Select
+                  key={o.key}
+                  label={o.label}
+                  options={BULK_CHOICES}
+                  value={bulkChoice[o.key] || "keep"}
+                  onChange={(v) => setBulkChoice((cur) => ({ ...cur, [o.key]: v }))}
+                  helpText={
+                    o.key in bulkPreview.patch
+                      ? `${bulkPreview.perKey[o.key] || 0} de ${bulkSelected.length} bundle(s) mudam`
+                      : undefined
+                  }
+                />
+              ))}
+              {bulkPreview.showWithoutExemption > 0 && (
+                <Banner tone="warning">
+                  <p>
+                    {bulkPreview.showWithoutExemption} bundle(s) vão ficar com &quot;Mostrar desconto do add-on no carrinho&quot; sem isenção fiscal. Essa opção só tem efeito com a isenção ativa.
+                  </p>
+                </Banner>
+              )}
+              <Text as="p" tone="subdued" variant="bodySm">
+                Só muda essas opções; o resto de cada bundle fica igual. Uma cópia do config atual é guardada antes de gravar.
+              </Text>
+            </BlockStack>
+          </Modal.Section>
+        </Modal>
+      )}
     </Page>
   );
 }

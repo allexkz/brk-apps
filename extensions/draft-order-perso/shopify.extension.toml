@@ -1,4 +1,4 @@
-api_version = "2025-10"
+api_version = "2026-04"
 uid = "00af77c5-33b4-a278-2c87-906d2c0d9b3969485c06"
 [[extensions]]
 # Change the merchant-facing name of the extension in locales/en.default.json

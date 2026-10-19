@@ -4,8 +4,9 @@ import {
   useActionData,
   useSubmit,
   useNavigation,
+  useFetcher,
 } from "@remix-run/react";
-import { useState, useCallback, useMemo, useRef } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import {
   Page,
   Layout,
@@ -28,11 +29,22 @@ import {
 import { useAppBridge } from "@shopify/app-bridge-react";
 
 import { getShopify } from "../shopify.server";
+import {
+  loadGroups,
+  loadShopState,
+  listMetaobjectGroups,
+  upsertMetaobjectGroups,
+  deleteMetaobjects,
+  setStorage,
+  clearStorage,
+  sameGroup,
+} from "../grupos-store.server";
 
 const NS = "brk_groups";
 const KEY_LISTING = "combined_listing"; // per-product json: { groupId, optionName, swatchSource, items:[{id,value,color}] }
 const KEY_GROUP = "product_group"; // per-product list.product_reference: irmãos do grupo — resolução por ID (à prova de mudança de handle)
-const KEY_INDEX = "index"; // shop metafield (admin index)
+const KEY_INDEX = "index"; // shop metafield (índice legado: só lido; ver grupos-store.server.js)
+const MIGRATE_PAGE = 50; // grupos por chamada na migração p/ metaobjects (loop no cliente)
 
 function numericId(gid) {
   return Number(String(gid).split("/").pop());
@@ -143,6 +155,26 @@ async function saveIndex(admin, shopId, groups) {
   );
   const data = await res.json();
   return data.data.metafieldsSet.userErrors;
+}
+
+// Grava na fonte ativa os grupos alterados (changedIds) e removidos (removedIds)
+// — SEMPRE antes de mexer nos metafields dos produtos, p/ nunca deixar produto
+// com grupo que o admin não conhece. Retorna mensagens de erro (vazio = ok).
+// Fonte "index" (antes de migrar): regrava o blob inteiro, como antes.
+async function persistGroups(admin, st, nextGroups, changedIds, removedIds) {
+  if (st.source === "metaobjects") {
+    let maxPos = Math.max(-1, ...st.ctx.positions.values());
+    const byId = new Map(nextGroups.map((g) => [g.id, g]));
+    const items = changedIds.map((id) => {
+      let position = st.ctx.positions.get(id);
+      if (position === undefined) position = ++maxPos;
+      return { group: byId.get(id), position };
+    });
+    const errs = await upsertMetaobjectGroups(admin, items);
+    if (errs.length) return errs;
+    return deleteMetaobjects(admin, removedIds.map((id) => st.ctx.ids.get(id)));
+  }
+  return (await saveIndex(admin, st.shopId, nextGroups)).map((e) => e.message);
 }
 
 function chunk(arr, size) {
@@ -297,11 +329,26 @@ export const loader = async ({ request, context }) => {
   const shopify = getShopify(context.env);
   const { admin } = await shopify.authenticate.admin(request);
 
-  const { groups, missingDefs } = await loadIndex(admin, { checkDefs: true });
+  const { groups: legacy, missingDefs } = await loadIndex(admin, { checkDefs: true });
   if (missingDefs) await ensureDefinitions(admin);
 
-  return json({ groups });
+  const { source } = await loadShopState(admin);
+  const mo = await listMetaobjectGroups(admin);
+  // Antes de migrar, a lista vem do índice legado e `migratedCount` mostra quantos
+  // grupos já foram copiados p/ metaobjects (retomada da migração).
+  return json({
+    groups: source === "metaobjects" ? mo.groups : legacy,
+    storage: { source, legacyCount: legacy.length, migratedCount: mo.groups.length },
+  });
 };
+
+// A cópia e a verificação da migração não precisam recarregar o loader (que
+// baixa o índice legado inteiro) a cada página.
+export function shouldRevalidate({ formData, defaultShouldRevalidate }) {
+  const intent = formData?.get("intent");
+  if (intent === "migrateGroups" || intent === "verifyGroups") return false;
+  return defaultShouldRevalidate;
+}
 
 // ── Action ──────────────────────────────────────────────────────────────────
 
@@ -312,7 +359,46 @@ export const action = async ({ request, context }) => {
     const formData = await request.formData();
     const intent = formData.get("intent");
 
-    const { shopId, groups } = await loadIndex(admin);
+    // ── Migração do índice legado p/ metaobjects ──
+    // migrateGroups: copia 1 página do índice (upsert idempotente, pode repetir).
+    // verifyGroups: compara grupo a grupo; activateMetaobjects só liga a fonte nova
+    // se a verificação passar. deactivateMetaobjects = rollback (volta a ler o índice).
+    if (intent === "migrateGroups" || intent === "verifyGroups" || intent === "activateMetaobjects") {
+      const st = await loadShopState(admin, { withIndex: true });
+      if (intent === "migrateGroups") {
+        const offset = Math.max(0, Number(formData.get("offset")) || 0);
+        const slice = st.legacy.slice(offset, offset + MIGRATE_PAGE);
+        const errors = await upsertMetaobjectGroups(admin, slice.map((group, k) => ({ group, position: offset + k })));
+        const next = offset + slice.length;
+        return json({ action: "migrateGroups", total: st.legacy.length, next, done: next >= st.legacy.length, errors });
+      }
+      const mo = await listMetaobjectGroups(admin);
+      const byId = new Map(mo.groups.map((g) => [g.id, g]));
+      const missing = [];
+      const different = [];
+      for (const g of st.legacy) {
+        const m = byId.get(g.id);
+        if (!m) missing.push(g.name || g.id);
+        else if (!sameGroup(g, m)) different.push(g.name || g.id);
+      }
+      const legacyIds = new Set(st.legacy.map((g) => g.id));
+      const extra = mo.groups.filter((g) => !legacyIds.has(g.id)).length;
+      const ok = missing.length === 0 && different.length === 0;
+      const report = { total: st.legacy.length, migrated: mo.groups.length, missing: missing.slice(0, 20), missingCount: missing.length, different: different.slice(0, 20), differentCount: different.length, extra, ok };
+      if (intent === "verifyGroups" || !ok) return json({ action: "verifyGroups", ...report });
+      const errs = await setStorage(admin, st.shopId, "metaobjects");
+      if (errs.length) return json({ success: false, error: errs.join(", ") });
+      return json({ success: true, action: "activateMetaobjects", ...report });
+    }
+    if (intent === "deactivateMetaobjects") {
+      const st = await loadShopState(admin);
+      const errs = await clearStorage(admin, st.shopId);
+      if (errs.length) return json({ success: false, error: errs.join(", ") });
+      return json({ success: true, action: "deactivateMetaobjects" });
+    }
+
+    const st = await loadGroups(admin);
+    const groups = st.groups;
 
     if (intent === "save") {
       const group = JSON.parse(formData.get("group"));
@@ -333,14 +419,6 @@ export const action = async ({ request, context }) => {
       const currentGids = new Set(group.products.map((p) => p.productGid));
       const removedGids = prevGids.filter((gid) => !currentGids.has(gid));
 
-      if (group.status === "active") {
-        await setMetafieldsChunked(admin, groupMetafieldObjects(group.products, combined, groupRefs));
-      } else {
-        // grupo não-ativo: não renderiza na loja
-        await deleteGroupMetafields(admin, group.products.map((p) => p.productGid));
-      }
-      await deleteGroupMetafields(admin, removedGids);
-
       const entry = {
         id,
         name: group.name || id,
@@ -352,8 +430,17 @@ export const action = async ({ request, context }) => {
       const i = groups.findIndex((g) => g.id === id);
       if (i >= 0) groups[i] = entry; else groups.push(entry);
 
-      const errs = await saveIndex(admin, shopId, groups);
-      if (errs.length) return json({ success: false, error: errs.map((e) => e.message).join(", ") });
+      // grupo primeiro; produtos só se o grupo gravou
+      const errs = await persistGroups(admin, st, groups, [id], []);
+      if (errs.length) return json({ success: false, error: errs.join(", ") });
+
+      if (entry.status === "active") {
+        await setMetafieldsChunked(admin, groupMetafieldObjects(group.products, combined, groupRefs));
+      } else {
+        // grupo não-ativo: não renderiza na loja
+        await deleteGroupMetafields(admin, group.products.map((p) => p.productGid));
+      }
+      await deleteGroupMetafields(admin, removedGids);
 
       return json({ success: true, action: "save", id });
     }
@@ -363,6 +450,7 @@ export const action = async ({ request, context }) => {
 
       const writes = []; // objetos metafieldsSet
       const deletes = []; // gids a limpar
+      const changedIds = [];
       let savedGroups = 0;
       let skippedGroups = 0;
 
@@ -394,6 +482,7 @@ export const action = async ({ request, context }) => {
         const entry = { id, name: group.name || id, optionName: group.optionName, status, swatchSource, products: group.products };
         const i = groups.findIndex((g) => g.id === id);
         if (i >= 0) groups[i] = entry; else groups.push(entry);
+        changedIds.push(id);
         savedGroups++;
       }
 
@@ -401,10 +490,10 @@ export const action = async ({ request, context }) => {
         return json({ success: false, error: "Nenhum grupo válido para salvar (cada grupo precisa de nome da opção, 2+ produtos e o valor de cada produto preenchido)." });
       }
 
+      const errs = await persistGroups(admin, st, groups, changedIds, []);
+      if (errs.length) return json({ success: false, error: errs.join(", ") });
       await setMetafieldsChunked(admin, writes);
       await deleteGroupMetafields(admin, deletes);
-      const errs = await saveIndex(admin, shopId, groups);
-      if (errs.length) return json({ success: false, error: errs.map((e) => e.message).join(", ") });
 
       return json({ success: true, action: "saveMany", savedGroups, skippedGroups });
     }
@@ -412,12 +501,12 @@ export const action = async ({ request, context }) => {
     if (intent === "delete") {
       const id = formData.get("id");
       const target = groups.find((g) => g.id === id);
+      const next = groups.filter((g) => g.id !== id);
+      const errs = await persistGroups(admin, st, next, [], target ? [id] : []);
+      if (errs.length) return json({ success: false, error: errs.join(", ") });
       if (target) {
         await deleteGroupMetafields(admin, target.products.map((p) => p.productGid));
       }
-      const next = groups.filter((g) => g.id !== id);
-      const errs = await saveIndex(admin, shopId, next);
-      if (errs.length) return json({ success: false, error: errs.map((e) => e.message).join(", ") });
       return json({ success: true, action: "delete" });
     }
 
@@ -426,10 +515,10 @@ export const action = async ({ request, context }) => {
       const idSet = new Set(ids);
       const targets = groups.filter((g) => idSet.has(g.id));
       const gids = targets.flatMap((g) => g.products.map((p) => p.productGid));
-      await deleteGroupMetafields(admin, gids);
       const next = groups.filter((g) => !idSet.has(g.id));
-      const errs = await saveIndex(admin, shopId, next);
-      if (errs.length) return json({ success: false, error: errs.map((e) => e.message).join(", ") });
+      const errs = await persistGroups(admin, st, next, [], targets.map((g) => g.id));
+      if (errs.length) return json({ success: false, error: errs.join(", ") });
+      await deleteGroupMetafields(admin, gids);
       return json({ success: true, action: "deleteMany", count: targets.length });
     }
 
@@ -485,6 +574,7 @@ export const action = async ({ request, context }) => {
       const missing = new Set();
       const writes = []; // objetos metafieldsSet
       const deletes = []; // gids
+      const changedIds = [];
       let importedGroups = 0;
       let skippedGroups = 0;
 
@@ -515,13 +605,14 @@ export const action = async ({ request, context }) => {
         const entry = { id, name: g.name, optionName: g.optionName, status, swatchSource, products };
         const i = groups.findIndex((x) => x.id === id);
         if (i >= 0) groups[i] = entry; else groups.push(entry);
+        changedIds.push(id);
         importedGroups++;
       }
 
+      const errs = await persistGroups(admin, st, groups, changedIds, []);
+      if (errs.length) return json({ success: false, error: errs.join(", ") });
       await setMetafieldsChunked(admin, writes);
       await deleteGroupMetafields(admin, deletes);
-      const errs = await saveIndex(admin, shopId, groups);
-      if (errs.length) return json({ success: false, error: errs.map((e) => e.message).join(", ") });
 
       return json({
         success: true,
@@ -601,11 +692,38 @@ function isGroupValid(g) {
 }
 
 export default function GruposDeProdutos() {
-  const { groups } = useLoaderData();
+  const { groups, storage } = useLoaderData();
   const actionData = useActionData();
   const submit = useSubmit();
   const navigation = useNavigation();
   const shopify = useAppBridge();
+
+  // ── Migração p/ metaobjects (loop página a página pelo cliente) ──
+  const migrateFetcher = useFetcher();
+  const [migration, setMigration] = useState(null); // { running, next, total, errors }
+  const startMigration = useCallback(() => {
+    setMigration({ running: true, next: 0, total: storage.legacyCount, errors: [] });
+    migrateFetcher.submit({ intent: "migrateGroups", offset: "0" }, { method: "post" });
+  }, [migrateFetcher, storage.legacyCount]);
+  const lastMigrate = useRef(null);
+  useEffect(() => {
+    const d = migrateFetcher.data;
+    if (!d || d === lastMigrate.current) return;
+    lastMigrate.current = d;
+    if (d.action !== "migrateGroups") {
+      setMigration((cur) => cur && { ...cur, running: false, errors: [...cur.errors, d.error || "Erro desconhecido."] });
+      return;
+    }
+    const keepGoing = !d.done && d.errors.length === 0;
+    setMigration((cur) => cur && { ...cur, next: d.next, total: d.total, errors: [...cur.errors, ...d.errors], running: keepGoing });
+    if (keepGoing) migrateFetcher.submit({ intent: "migrateGroups", offset: String(d.next) }, { method: "post" });
+  }, [migrateFetcher.data, migrateFetcher]);
+  const verifyFetcher = useFetcher();
+  const runIntent = useCallback((intent) => {
+    const fd = new FormData();
+    fd.set("intent", intent);
+    submit(fd, { method: "post" });
+  }, [submit]);
 
   const [editing, setEditing] = useState(null); // null = lista; array = editor (1+ grupos)
   const isSubmitting = navigation.state === "submitting";
@@ -1016,6 +1134,79 @@ export default function GruposDeProdutos() {
         )}
         {actionData?.error && (
           <Banner tone="critical" title="Erro"><p>{actionData.error}</p></Banner>
+        )}
+        {actionData?.success && actionData.action === "activateMetaobjects" && (
+          <Banner tone="success" title={`Novo armazenamento ativado: ${actionData.migrated} grupo(s).`}>
+            <Text as="p" variant="bodySm">Cada grupo agora é um registro próprio. O índice antigo ficou intacto como backup.</Text>
+          </Banner>
+        )}
+        {actionData?.success && actionData.action === "deactivateMetaobjects" && (
+          <Banner tone="warning" title="Voltou a ler o índice antigo.">
+            <Text as="p" variant="bodySm">Grupos criados ou editados depois da migração não estão nele.</Text>
+          </Banner>
+        )}
+
+        {storage.source === "index" && (
+          <Banner tone="warning" title="Migração necessária: novo armazenamento dos grupos">
+            <BlockStack gap="200">
+              <Text as="p" variant="bodySm">
+                O índice atual ({storage.legacyCount} grupos) passou do limite de 128 KB que a Shopify aceita gravar: salvar, excluir e importar grupos falham até migrar. A migração copia cada grupo para um registro próprio (metaobject). O índice antigo não é alterado e continua como backup; a loja não muda (ela lê os metafields dos produtos).
+              </Text>
+              <Text as="p" variant="bodySm">
+                {migration
+                  ? `Copiando… ${migration.next} de ${migration.total}${migration.running ? "" : " (parado)"}`
+                  : `${storage.migratedCount} de ${storage.legacyCount} grupo(s) já copiados.`}
+              </Text>
+              {migration?.errors.length > 0 && (
+                <Text as="p" variant="bodySm" tone="critical">{migration.errors.slice(0, 5).join(" · ")}</Text>
+              )}
+              {verifyFetcher.data?.action === "verifyGroups" && (
+                <Text as="p" variant="bodySm" tone={verifyFetcher.data.ok ? "success" : "critical"}>
+                  {verifyFetcher.data.ok
+                    ? `Verificação ok: ${verifyFetcher.data.total} de ${verifyFetcher.data.total} grupos idênticos.`
+                    : `Verificação falhou: ${verifyFetcher.data.missingCount} faltando, ${verifyFetcher.data.differentCount} diferente(s) (ex.: ${verifyFetcher.data.missing.concat(verifyFetcher.data.different).slice(0, 5).join(", ")}). Rode a cópia de novo.`}
+                </Text>
+              )}
+              <InlineStack gap="200">
+                <Button onClick={startMigration} loading={!!migration?.running}>1. Copiar grupos</Button>
+                <Button
+                  onClick={() => verifyFetcher.submit({ intent: "verifyGroups" }, { method: "post" })}
+                  loading={verifyFetcher.state !== "idle"}
+                  disabled={!!migration?.running}
+                >
+                  2. Verificar
+                </Button>
+                <Button
+                  variant="primary"
+                  onClick={() => runIntent("activateMetaobjects")}
+                  loading={isSubmitting && navigation.formData?.get("intent") === "activateMetaobjects"}
+                  disabled={!verifyFetcher.data?.ok || !!migration?.running}
+                >
+                  3. Ativar novo armazenamento
+                </Button>
+              </InlineStack>
+            </BlockStack>
+          </Banner>
+        )}
+        {actionData?.action === "verifyGroups" && !actionData.ok && (
+          <Banner tone="critical" title="Ativação cancelada: a verificação não bateu.">
+            <Text as="p" variant="bodySm">{actionData.missingCount} faltando, {actionData.differentCount} diferente(s). Rode a cópia de novo.</Text>
+          </Banner>
+        )}
+
+        {storage.source === "metaobjects" && (
+          <InlineStack gap="200" blockAlign="center">
+            <Text as="span" tone="subdued" variant="bodySm">Armazenamento: 1 registro por grupo (metaobjects).</Text>
+            <Button
+              variant="plain"
+              tone="critical"
+              onClick={() => {
+                if (window.confirm("Voltar a ler o índice antigo? Grupos criados ou editados depois da migração não estão nele.")) runIntent("deactivateMetaobjects");
+              }}
+            >
+              Voltar ao índice antigo
+            </Button>
+          </InlineStack>
         )}
 
         <Banner tone="info">

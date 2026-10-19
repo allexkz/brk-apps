@@ -26,7 +26,8 @@
                     "isMember": true
                   }
                 ],
-                "hasTags": []
+                "hasTags": [],
+                "fn": null
               }
             }
           },
@@ -55,7 +56,8 @@
                     "isMember": false
                   }
                 ],
-                "hasTags": []
+                "hasTags": [],
+                "fn": null
               }
             }
           }

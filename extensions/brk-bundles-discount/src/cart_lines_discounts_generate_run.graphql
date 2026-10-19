@@ -36,6 +36,9 @@ query Input($collectionIds: [ID!]! = [], $tags: [String!]! = []) {
               tag
               hasTag
             }
+            fn: metafield(namespace: "brk_bundles", key: "fn") {
+              jsonValue
+            }
           }
         }
       }

@@ -22,6 +22,79 @@ scopes = "read_all_orders,read_analytics,read_checkouts,read_customers,read_deli
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
+# Grupos de Produtos: 1 registro por grupo (fonte da verdade do admin). Substitui o
+# shop metafield brk_groups.index (blob único, travado no limite de 128 KB do JSON
+# a partir da Admin API 2026-04). O tema não lê isto: continua nos metafields por
+# produto brk_groups.combined_listing / product_group.
+[metaobjects.app.brk_group]
+name = "Grupo de Produtos (BRK)"
+display_name_field = "name"
+access.admin = "merchant_read"
+access.storefront = "none"
+
+[metaobjects.app.brk_group.fields.group_id]
+name = "ID do grupo"
+type = "single_line_text_field"
+required = true
+
+[metaobjects.app.brk_group.fields.name]
+name = "Nome"
+type = "single_line_text_field"
+
+[metaobjects.app.brk_group.fields.option_name]
+name = "Nome da opção"
+type = "single_line_text_field"
+
+[metaobjects.app.brk_group.fields.status]
+name = "Status"
+type = "single_line_text_field"
+
+[metaobjects.app.brk_group.fields.swatch_source]
+name = "Origem do swatch"
+type = "single_line_text_field"
+
+[metaobjects.app.brk_group.fields.position]
+name = "Ordem"
+type = "number_integer"
+
+[metaobjects.app.brk_group.fields.products]
+name = "Produtos"
+type = "json"
+
+# BRK Bundles: 1 registro por bundle (fonte da verdade do admin e do webhook, depois
+# de migrar). Substitui o shop metafield brk_bundles.config (blob único). O checkout
+# não lê isto (usa o metafield da discount + `fn` dos produtos). O tema lê o campo
+# `storefront` quando a vitrine nova está ativa (senão, brk_bundles.live).
+[metaobjects.app.brk_bundle]
+name = "Bundle (BRK)"
+display_name_field = "name"
+access.admin = "merchant_read"
+# public_read: a vitrine nova (bloco do produto + carrinho do tema) lê o campo
+# `storefront` de cada bundle direto do registro.
+access.storefront = "public_read"
+
+[metaobjects.app.brk_bundle.fields.bundle_id]
+name = "ID do bundle"
+type = "single_line_text_field"
+required = true
+
+[metaobjects.app.brk_bundle.fields.name]
+name = "Nome"
+type = "single_line_text_field"
+
+[metaobjects.app.brk_bundle.fields.position]
+name = "Ordem"
+type = "number_integer"
+
+[metaobjects.app.brk_bundle.fields.data]
+name = "Configuração"
+type = "json"
+
+# O que o tema lê (mesmo formato de um item do antigo brk_bundles.live).
+[metaobjects.app.brk_bundle.fields.storefront]
+name = "Vitrine"
+type = "json"
+
 [auth]
 redirect_urls = [
   "https://brk-apps-fishing.allexadriel.workers.dev/auth/callback"

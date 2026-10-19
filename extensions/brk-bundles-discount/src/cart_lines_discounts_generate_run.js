@@ -23,7 +23,8 @@ import {
  *     "enabled": true,
  *     "items": { "<addonProductId>": { "mode": "gift"|"percent"|"fixed", "value": 10, "label": "..", "maxQty": 1, "applyTo": "addon"|"trigger" } },
  *     "targets": { "type": "products"|"collections"|"tags", "productIds": ["1"], "collectionIds": ["2"], "tags": ["x"] },
- *     "perTrigger": true   // opcional: limite por produto do bundle (ver Regras)
+ *     "perTrigger": true,  // opcional: limite por produto do bundle (ver Regras)
+ *     "exclude": { "productIds": ["3"], "collectionIds": ["4"], "tags": ["y"] }  // opcional (ver Regras)
  *   } },
  *   "collectionIds": ["gid://shopify/Collection/2"], "tags": ["x"] }  // variables do input query
  *
@@ -32,15 +33,28 @@ import {
  *   "b": { "<bundleId>": {
  *     "i": { "<addonProductId>": { "m": "g"|"p"|"f", "v": 10, "l": <índice em L>, "q": 1, "a": 1 } },  // a=1 → isenção
  *     "t": { "k": "p"|"c"|"g", "ids": [1, 2] },  // produtos / collections (ids numéricos) / tags
- *     "u": 1                                      // opcional: perTrigger
+ *     "u": 1,                                     // opcional: perTrigger
+ *     "x": { "p": [3], "c": [4], "g": ["y"] }     // opcional: exclusões (produtos / collections / tags)
  *   } } }
- * Ambos são normalizados p/ o formato acima por `normalizeBundles`.
+ * Formato v3 (bundles por produto específico moram no próprio produto-gatilho, p/
+ * a config da discount não crescer com eles):
+ *   discount: { "v": 3, "L", "collectionIds", "tags", "b": { só bundles amplos, como no v2 },
+ *               "a": [3, 7, …] }   // chaves (k) dos bundles por produto ATIVOS
+ *   produto (metafield brk_bundles.fn): { "<bundleId>": { "k": 3,
+ *     "i": { "<addonProductId>": { "m", "v", "l": "<label>", "q", "a"? } }, "u"?: 1,
+ *     "x"?: { "p", "c", "g" },          // exclusões (como no v2)
+ *     "h", "o" } }                      // handle e ordem: só p/ a vitrine (ignorados aqui)
+ * Um bundle por produto vale se algum produto do carrinho o tiver no `fn` com `k` em
+ * `a`; o gatilho elegível é o produto que o tem no `fn` (igual a `targets.products`).
+ * Todos são normalizados p/ o formato acima por `normalizeBundles` / `addProductBundles`.
  *
  * Regras:
  *   - a linha precisa ser do próprio produto add-on (`_brk_bundle_item`);
  *   - bundle com `targets`: o gatilho é obrigatório e precisa ser elegível
  *     (produto / collection / tag). Sem `targets` (config antiga, ou validação
  *     desligada pelo admin) vale só a regra abaixo;
+ *   - `exclude`: produto excluído nunca vale como gatilho (exclusão vence a
+ *     segmentação), com ou sem `targets`;
  *   - só aplica se o produto-gatilho ainda está no carrinho;
  *   - limita a qtd descontada por item ao `maxQty` do item (padrão 1; 0 = ilimitado);
  *   - `perTrigger` (limite por produto do bundle): o `maxQty` vale para cada unidade
@@ -59,7 +73,8 @@ export function cartLinesDiscountsGenerateRun(input) {
     return { operations: [] };
   }
 
-  const bundles = normalizeBundles(input.discount.metafield?.jsonValue);
+  const config = input.discount.metafield?.jsonValue;
+  const bundles = normalizeBundles(config);
 
   // Presença de cada produto no carrinho (anti-exploit do trigger) e linhas
   // "normais" (fora de bundle) de cada produto, alvo da isenção.
@@ -87,13 +102,16 @@ export function cartLinesDiscountsGenerateRun(input) {
     if (lb && lt) (bundleTriggers[lb] = bundleTriggers[lb] || new Set()).add(String(lt));
   }
 
+  // v3: bundles por produto vindos do `fn` dos produtos do carrinho.
+  if (config && config.v === 3) addProductBundles(bundles, config, input.cart.lines);
+
   // `perTrigger`: produtos do carrinho que valem como gatilho do bundle. Pela
   // segmentação; sem segmentação validável (sem `targets`), só os gatilhos
   // gravados nas linhas do bundle. Os gravados vêm primeiro (recebem a isenção).
   const eligibleCache = {};
   function eligibleTriggers(bundleId, cfg) {
     if (eligibleCache[bundleId]) return eligibleCache[bundleId];
-    const t = cfg.targets && ["products", "collections", "tags"].includes(cfg.targets.type) ? cfg.targets : null;
+    const t = cfg.targets && ["products", "collections", "tags", "fn"].includes(cfg.targets.type) ? cfg.targets : null;
     const registered = bundleTriggers[bundleId] || new Set();
     const items = cfg.items || {};
     const first = [];
@@ -101,6 +119,7 @@ export function cartLinesDiscountsGenerateRun(input) {
     let units = 0;
     for (const pid of triggerPids) {
       if (items[pid]) continue; // o próprio add-on não conta como gatilho
+      if (isExcluded(cfg.exclude, pid, productInfo[pid])) continue;
       if (!(t ? isEligible(t, pid, productInfo[pid]) : registered.has(pid))) continue;
       (registered.has(pid) ? first : rest).push(pid);
       for (const l of triggerLines[pid]) units += l.quantity;
@@ -139,6 +158,9 @@ export function cartLinesDiscountsGenerateRun(input) {
     } else {
       // Anti-exploit: produto-gatilho precisa estar no carrinho.
       if (trig && !(productQty[String(trig)] > 0)) continue;
+
+      // Exclusões: gatilho excluído não recebe o bundle.
+      if (trig && isExcluded(bundleCfg.exclude, String(trig), productInfo[String(trig)])) continue;
 
       // Segmentação: com `targets`, o gatilho é obrigatório e precisa ser elegível.
       if (bundleCfg.targets) {
@@ -244,7 +266,7 @@ const V2_KINDS = { p: ["products", "productIds"], c: ["collections", "collection
  */
 function normalizeBundles(config) {
   if (!config) return {};
-  if (config.v !== 2) return config.bundles || {};
+  if (config.v !== 2 && config.v !== 3) return config.bundles || {};
   const labels = config.L || [];
   /** @type {Record<string, any>} */
   const out = {};
@@ -267,9 +289,67 @@ function normalizeBundles(config) {
     if (e.u) entry.perTrigger = true;
     const kind = e.t && V2_KINDS[e.t.k];
     if (kind) entry.targets = { type: kind[0], [kind[1]]: (e.t.ids || []).map(String) };
+    if (e.x) {
+      entry.exclude = {
+        productIds: (e.x.p || []).map(String),
+        collectionIds: (e.x.c || []).map(String),
+        tags: (e.x.g || []).map(String),
+      };
+    }
     out[id] = entry;
   }
   return out;
+}
+
+/**
+ * v3: acrescenta os bundles por produto lidos do metafield `fn` de cada produto do
+ * carrinho (só os com `k` em `config.a`, i.e. ativos). A elegibilidade vira
+ * `targets: { type: "fn", productIds }` = os produtos do carrinho que têm o bundle.
+ * @param {Record<string, any>} bundles
+ * @param {any} config
+ * @param {any[]} lines
+ */
+function addProductBundles(bundles, config, lines) {
+  const active = new Set((config.a || []).map(Number));
+  for (const line of lines) {
+    const m = line.merchandise;
+    if (!m || m.__typename !== "ProductVariant" || !m.product) continue;
+    const fn = m.product.fn && m.product.fn.jsonValue;
+    if (!fn || typeof fn !== "object") continue;
+    const pid = numericId(m.product.id);
+    for (const bid of Object.keys(fn)) {
+      const e = fn[bid] || {};
+      if (!active.has(Number(e.k))) continue;
+      // id que já é de bundle amplo (com ou sem segmentação): o `fn` não o sobrescreve
+      if (bundles[bid] && !(bundles[bid].targets && bundles[bid].targets.type === "fn")) continue;
+      if (!bundles[bid]) {
+        /** @type {Record<string, any>} */
+        const items = {};
+        for (const apid of Object.keys(e.i || {})) {
+          const it = e.i[apid] || {};
+          items[apid] = {
+            mode: V2_MODES[it.m] || it.m,
+            value: it.v,
+            label: it.l,
+            maxQty: it.q,
+            applyTo: it.a ? "trigger" : "addon",
+          };
+        }
+        /** @type {any} */
+        const entry = { enabled: true, items, targets: { type: "fn", productIds: [] } };
+        if (e.u) entry.perTrigger = true;
+        if (e.x) {
+          entry.exclude = {
+            productIds: (e.x.p || []).map(String),
+            collectionIds: (e.x.c || []).map(String),
+            tags: (e.x.g || []).map(String),
+          };
+        }
+        bundles[bid] = entry;
+      }
+      if (!bundles[bid].targets.productIds.includes(pid)) bundles[bid].targets.productIds.push(pid);
+    }
+  }
 }
 
 /** Extrai o id numérico de um GID. */
@@ -301,7 +381,7 @@ function membershipOf(product) {
  * @param {{colls: Set<string>, tags: Set<string>} | undefined} info
  */
 function isEligible(targets, pid, info) {
-  if (targets.type === "products") {
+  if (targets.type === "products" || targets.type === "fn") {
     return (targets.productIds || []).some((id) => String(id) === pid);
   }
   if (targets.type === "collections") {
@@ -311,6 +391,20 @@ function isEligible(targets, pid, info) {
     return !!info && (targets.tags || []).some((t) => info.tags.has(String(t).toLowerCase()));
   }
   return true;
+}
+
+/**
+ * O produto está nas exclusões do bundle (produto / collection / tag)?
+ * @param {{productIds?: string[], collectionIds?: string[], tags?: string[]} | undefined} exclude
+ * @param {string} pid
+ * @param {{colls: Set<string>, tags: Set<string>} | undefined} info
+ */
+function isExcluded(exclude, pid, info) {
+  if (!exclude) return false;
+  if ((exclude.productIds || []).some((id) => String(id) === pid)) return true;
+  if (!info) return false;
+  if ((exclude.collectionIds || []).some((id) => info.colls.has(String(id)))) return true;
+  return (exclude.tags || []).some((t) => info.tags.has(String(t).toLowerCase()));
 }
 
 /** Preço unitário da linha em centavos. */
