@@ -12,6 +12,8 @@
 //     de baixar até 250 coleções por produto.
 // A lógica de elegibilidade (unidades por coleção e gatilhos) é a mesma.
 
+import { listMetaobjectBundles } from "./bundles-store.server.js";
+
 export const BUNDLES_NS = "brk_bundles";
 export const BUNDLES_KEY = "config";
 export const DISCOUNT_NS = "$app:descontos-personalizados";
@@ -40,13 +42,20 @@ export function orderHasBundleLines(order) {
   return (order?.line_items || []).some((li) => bundleIdOf(li) != null);
 }
 
-// Config de bundles (shop metafield) → map id → bundle (usamos mode + orderTags).
+// Config de bundles → map id → bundle (usamos mode + orderTags). Fonte: o shop
+// metafield `config`, ou os metaobjects quando o armazenamento novo está ativo
+// (`brk_bundles.storage` = "metaobjects", ver bundles-store.server.js).
 export async function loadBundlesConfig(admin) {
   try {
-    const res = await admin.graphql(`query { shop { metafield(namespace: "${BUNDLES_NS}", key: "${BUNDLES_KEY}") { value } } }`);
+    const res = await admin.graphql(`query { shop { storage: metafield(namespace: "${BUNDLES_NS}", key: "storage") { value } metafield(namespace: "${BUNDLES_NS}", key: "${BUNDLES_KEY}") { value } } }`);
     const data = await res.json();
-    const raw = data?.data?.shop?.metafield?.value;
-    const list = raw ? JSON.parse(raw) : [];
+    let list;
+    if (data?.data?.shop?.storage?.value === "metaobjects") {
+      list = (await listMetaobjectBundles(admin)).bundles;
+    } else {
+      const raw = data?.data?.shop?.metafield?.value;
+      list = raw ? JSON.parse(raw) : [];
+    }
     const map = {};
     for (const b of list) map[b.id] = b;
     return map;

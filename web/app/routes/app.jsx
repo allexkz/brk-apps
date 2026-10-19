@@ -28,6 +28,7 @@ export default function App() {
         <Link to="/app/grupos-de-produtos">Grupos de Produtos</Link>
         <Link to="/app/personalizados">Personalizados</Link>
         <Link to="/app/descontos">Descontos</Link>
+        <Link to="/app/bundles">BRK Bundles</Link>
         <Link to="/app/skus-sankhya">SKUs Sankhya</Link>
       </NavMenu>
       <Outlet />

@@ -1,15 +1,17 @@
 import { getShopify } from "../shopify.server";
+import { recordBundleSales } from "../bundles-db.server";
 import { loadSellers } from "../vendedores";
 import { buildPersoFromRestOrder, ingestPersoOrder, orderHasPersoLine } from "../personalizados.server";
-import { collectDiscountTags, tagsAddToOrder } from "../order-tags.server";
+import { bundleAttribution, collectDiscountTags, tagsAddToOrder } from "../order-tags.server";
 
-// Webhook orders/create (motors — sem BRK Bundles). Cada etapa só faz trabalho quando o
-// pedido precisa dela (ver app/order-tags.server.js) — custo por pedido fixo e baixo:
-//   1) campanhas de desconto: só as ativas (na tela Descontos e na Shopify);
-//   2) personalização: só se o pedido tem PE1198 (ou, sem o D1 de personalizados, vendedor).
+// Webhook orders/create. Cada etapa só faz trabalho quando o pedido precisa dela
+// (ver app/order-tags.server.js) — custo por pedido fixo e baixo:
+//   1) bundles: só se o pedido tem linha `_brk_bundle` (lê a config, grava no D1, tags);
+//   2) campanhas de desconto: só as ativas (na tela Descontos e na Shopify);
+//   3) personalização: só se o pedido tem PE1198 (ou, sem o D1 de personalizados, vendedor).
 export const action = async ({ request, context }) => {
   const shopify = getShopify(context.env);
-  const { topic, session, admin, payload, shop } =
+  const { topic, shop, session, admin, payload } =
     await shopify.authenticate.webhook(request);
 
   if (!admin) {
@@ -22,9 +24,20 @@ export const action = async ({ request, context }) => {
         const order = payload;
         const orderGid =
           order.admin_graphql_api_id || `gid://shopify/Order/${order.id}`;
-        const tags = await collectDiscountTags(admin, order);
-        if (tags.length > 0) {
-          await tagsAddToOrder(admin, orderGid, tags);
+        const tagSet = new Set();
+
+        // 1) Bundles: atribuição de vendas (D1) + tags de bundle.
+        const { rows, tags: bundleTags } = await bundleAttribution(admin, order);
+        if (rows.length > 0) {
+          await recordBundleSales(context.env.BUNDLES_DB, shop, rows);
+        }
+        for (const t of bundleTags) tagSet.add(t);
+
+        // 2) Campanhas de desconto: tag por elegibilidade de coleção (só campanhas ativas).
+        for (const t of await collectDiscountTags(admin, order)) tagSet.add(t);
+
+        if (tagSet.size > 0) {
+          await tagsAddToOrder(admin, orderGid, [...tagSet]);
         }
       } catch (e) {
         // Não relança: um erro aqui não deve fazer o Shopify reentregar em loop.
@@ -32,7 +45,7 @@ export const action = async ({ request, context }) => {
       }
 
       // Personalização → Sankhya: ingestão do pedido novo (best-effort; o dreno reprocessa
-      // até o NUNOTA existir). Isolado num try próprio.
+      // até o NUNOTA existir). Isolado num try próprio para não interferir no bloco acima.
       // Sem PE1198 e com o D1 de personalizados, não há nada a registrar → nem lê vendedores.
       try {
         if (orderHasPersoLine(payload) || !context.env.PERSO_DB) {

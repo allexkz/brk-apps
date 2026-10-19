@@ -23,6 +23,12 @@ const MODULES = [
       "Associa as tags de pedido a cada vendedor, para atribuir o vendedor na tarefa do ClickUp.",
   },
   {
+    title: "BRK Bundles",
+    url: "/app/bundles",
+    description:
+      "Add-ons de upsell, cross-sell e brinde na página de produto, com o desconto aplicado no checkout.",
+  },
+  {
     title: "Descontos",
     url: "/app/descontos",
     description:

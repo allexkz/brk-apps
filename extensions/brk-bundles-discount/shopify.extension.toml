@@ -1,0 +1,25 @@
+api_version = "2026-01"
+uid = "58fd29a7-bc4a-fd60-b961-ae1157d32f8e9b14ef1e"
+
+# O `uid` é gerado automaticamente pela Shopify CLI no primeiro `shopify app dev`/`deploy`.
+
+[[extensions]]
+name = "BRK Bundles Desconto"
+handle = "brk-bundles-discount"
+type = "function"
+description = "Aplica o desconto do add-on (brinde 100% / porcentagem / valor fixo) no line item marcado com a property _brk_bundle — ou, com isenção, no produto vinculado"
+
+  [[extensions.targeting]]
+  target = "cart.lines.discounts.generate.run"
+  input_query = "src/cart_lines_discounts_generate_run.graphql"
+  export = "cart-lines-discounts-generate-run"
+
+  # Variables do input query ($collectionIds, $tags) vêm do mesmo metafield da
+  # discount (chaves de topo), gravado pela rota admin app.bundles.jsx.
+  [extensions.input.variables]
+  namespace = "brk-bundles"
+  key = "config"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"

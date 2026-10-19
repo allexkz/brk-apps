@@ -1,0 +1,47 @@
+query Input($collectionIds: [ID!]! = [], $tags: [String!]! = []) {
+  discount {
+    discountClasses
+    metafield(namespace: "brk-bundles", key: "config") {
+      jsonValue
+    }
+  }
+  cart {
+    lines {
+      id
+      quantity
+      cost {
+        amountPerQuantity {
+          amount
+        }
+      }
+      bundle: attribute(key: "_brk_bundle") {
+        value
+      }
+      item: attribute(key: "_brk_bundle_item") {
+        value
+      }
+      trigger: attribute(key: "_brk_bundle_trigger") {
+        value
+      }
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          product {
+            id
+            inCollections(ids: $collectionIds) {
+              collectionId
+              isMember
+            }
+            hasTags(tags: $tags) {
+              tag
+              hasTag
+            }
+            fn: metafield(namespace: "brk_bundles", key: "fn") {
+              jsonValue
+            }
+          }
+        }
+      }
+    }
+  }
+}

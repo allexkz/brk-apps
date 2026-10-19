@@ -16,6 +16,17 @@ SHOPIFY_APP_URL = "https://brk-apps-motors.allexadriel.workers.dev"
 binding = "SESSIONS"
 id = "a97c2751ab4c4b2f8c443ffcf087a1bf"
 
+# BRK Bundles — D1 para o tracking de vendas de bundle (relatório/estatísticas da tela).
+# Sem ele os bundles funcionam normalmente; só o relatório de vendas fica vazio
+# (bundles-db.server.js vira no-op). Para ligar:
+#   npx wrangler d1 create brk-bundles-motors
+#   (cole o database_id abaixo e descomente o bloco)
+#   npx wrangler d1 execute BUNDLES_DB --remote --file=./migrations/0001_bundle_sales.sql
+# [[d1_databases]]
+# binding = "BUNDLES_DB"
+# database_name = "brk-bundles-motors"
+# database_id = "<cole aqui>"
+
 # BRK Personalizados — estado do pipeline Sankhya por pedido (substitui os mapas do KV que
 # cresciam com o histórico). Migração (remoto):
 #   wrangler d1 migrations apply PERSO_DB --remote

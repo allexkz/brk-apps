@@ -1,0 +1,114 @@
+{
+  "payload": {
+    "export": "cart-lines-discounts-generate-run",
+    "target": "cart.lines.discounts.generate.run",
+    "input": {
+      "cart": {
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/0",
+            "quantity": 1,
+            "cost": {
+              "amountPerQuantity": {
+                "amount": "300.0"
+              }
+            },
+            "bundle": null,
+            "item": null,
+            "trigger": null,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "product": {
+                "id": "gid://shopify/Product/111",
+                "inCollections": [
+                  {
+                    "collectionId": "gid://shopify/Collection/77",
+                    "isMember": false
+                  },
+                  {
+                    "collectionId": "gid://shopify/Collection/88",
+                    "isMember": true
+                  }
+                ],
+                "hasTags": [],
+                "fn": null
+              }
+            }
+          },
+          {
+            "id": "gid://shopify/CartLine/1",
+            "quantity": 1,
+            "cost": {
+              "amountPerQuantity": {
+                "amount": "39.9"
+              }
+            },
+            "bundle": {
+              "value": "b1"
+            },
+            "item": {
+              "value": "999"
+            },
+            "trigger": {
+              "value": "111"
+            },
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "product": {
+                "id": "gid://shopify/Product/999",
+                "inCollections": [
+                  {
+                    "collectionId": "gid://shopify/Collection/77",
+                    "isMember": false
+                  },
+                  {
+                    "collectionId": "gid://shopify/Collection/88",
+                    "isMember": false
+                  }
+                ],
+                "hasTags": [],
+                "fn": null
+              }
+            }
+          }
+        ]
+      },
+      "discount": {
+        "discountClasses": [
+          "PRODUCT"
+        ],
+        "metafield": {
+          "jsonValue": {
+            "bundles": {
+              "b1": {
+                "enabled": true,
+                "items": {
+                  "999": {
+                    "mode": "gift",
+                    "label": "BRINDE",
+                    "maxQty": 1,
+                    "applyTo": "addon"
+                  }
+                },
+                "targets": {
+                  "type": "collections",
+                  "collectionIds": [
+                    "77"
+                  ]
+                }
+              }
+            },
+            "collectionIds": [
+              "gid://shopify/Collection/77",
+              "gid://shopify/Collection/88"
+            ],
+            "tags": []
+          }
+        }
+      }
+    },
+    "output": {
+      "operations": []
+    }
+  }
+}
