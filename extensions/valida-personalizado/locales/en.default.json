@@ -1,0 +1,4 @@
+{
+  "name": "Valida Personalizado",
+  "description": "Bloqueia o checkout quando o PE1198 esta no carrinho sem atributos de personalizacao."
+}
