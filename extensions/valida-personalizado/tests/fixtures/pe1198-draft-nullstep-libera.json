@@ -1,0 +1,28 @@
+{
+  "payload": {
+    "export": "cart-validations-generate-run",
+    "target": "cart.validations.generate.run",
+    "input": {
+      "buyerJourney": { "step": null },
+      "cart": {
+        "lines": [
+          {
+            "quantity": 1,
+            "merchandise": { "__typename": "ProductVariant", "sku": "PE1198" },
+            "nome": null,
+            "local": null
+          }
+        ]
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "validationAdd": {
+            "errors": []
+          }
+        }
+      ]
+    }
+  }
+}

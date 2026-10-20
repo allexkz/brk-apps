@@ -1,0 +1,17 @@
+api_version = "2026-01"
+uid = "063b3640-472c-3b18-ded3-d48b5869ead8e5819150"
+
+[[extensions]]
+name = "Valida Personalizado"
+handle = "valida-personalizado"
+type = "function"
+description = "Bloqueia a compra avulsa do item de personalizacao (PE1198) sem os atributos Nome/Local. So atua no carrinho da loja (buyerJourney CART_INTERACTION); nao bloqueia draft orders no admin (que avaliam em CHECKOUT_INTERACTION)."
+
+  [[extensions.targeting]]
+  target = "cart.validations.generate.run"
+  input_query = "src/cart_validations_generate_run.graphql"
+  export = "cart-validations-generate-run"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"

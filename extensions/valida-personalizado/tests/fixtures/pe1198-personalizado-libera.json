@@ -1,0 +1,34 @@
+{
+  "payload": {
+    "export": "cart-validations-generate-run",
+    "target": "cart.validations.generate.run",
+    "input": {
+      "buyerJourney": { "step": "CART_INTERACTION" },
+      "cart": {
+        "lines": [
+          {
+            "quantity": 1,
+            "merchandise": { "__typename": "ProductVariant", "sku": "CASUAL510BLM" },
+            "nome": null,
+            "local": null
+          },
+          {
+            "quantity": 1,
+            "merchandise": { "__typename": "ProductVariant", "sku": "PE1198" },
+            "nome": { "value": "Joao" },
+            "local": { "value": "Frente" }
+          }
+        ]
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "validationAdd": {
+            "errors": []
+          }
+        }
+      ]
+    }
+  }
+}

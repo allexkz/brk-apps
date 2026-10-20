@@ -1,0 +1,22 @@
+query CartValidationsGenerateRunInput {
+  buyerJourney {
+    step
+  }
+  cart {
+    lines {
+      quantity
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          sku
+        }
+      }
+      nome: attribute(key: "Nome") {
+        value
+      }
+      local: attribute(key: "Local") {
+        value
+      }
+    }
+  }
+}
