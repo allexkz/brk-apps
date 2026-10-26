@@ -30,6 +30,7 @@ export default function App() {
         <Link to="/app/bundles">BRK Bundles</Link>
         <Link to="/app/descontos">Descontos</Link>
         <Link to="/app/skus-sankhya">SKUs Sankhya</Link>
+        <Link to="/app/kits">Kits</Link>
       </NavMenu>
       <Outlet />
     </AppProvider>
