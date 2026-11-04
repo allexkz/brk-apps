@@ -49,6 +49,13 @@
 .brk-bd__price { font-size: 13px; margin-top: 2px; }
 .brk-bd__price s { opacity: .55; margin-right: 6px; }
 .brk-bd__price strong { color: var(--brk-bd-accent, #085B47); }
+.brk-bd__link {
+  display: inline-flex; align-items: center; gap: 3px; align-self: flex-start;
+  margin-top: 4px; font-size: 11px; line-height: 1.2;
+  color: inherit; opacity: .7; text-decoration: underline; text-underline-offset: 2px;
+}
+.brk-bd__link:hover { opacity: 1; color: var(--brk-bd-accent, #085B47); }
+.brk-bd__link-icon { flex: 0 0 auto; }
 .brk-bd__label {
   flex: 0 0 auto;
   background: var(--brk-bd-label-bg, #085B47);
