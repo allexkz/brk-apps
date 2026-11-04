@@ -228,6 +228,61 @@
     return vs[0];
   }
 
+  // Link "ver produto" do add-on: /variants/{id} redireciona (302) para a página do
+  // produto já com a variante, sem precisar do handle (o add-on só guarda ids).
+  var LINK_ICON = '<svg class="brk-bd__link-icon" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>';
+  function variantUrl(variantId) {
+    var root = (window.Shopify && Shopify.routes && Shopify.routes.root) || "/";
+    return root.replace(/\/$/, "") + "/variants/" + variantId;
+  }
+  function addonLink(variantId) {
+    var a = document.createElement("a");
+    a.className = "brk-bd__link";
+    a.href = variantUrl(variantId);
+    a.innerHTML = "ver produto" + LINK_ICON;
+    return a;
+  }
+
+  // Imagem do add-on ao vivo: o bundle guarda a URL da imagem de quando foi salvo, e
+  // ela quebra (404) quando as fotos do produto são trocadas. Busca a imagem atual
+  // pela Storefront API sem token (nodes por id) e troca o fundo do .brk-bd__img.
+  // Se a busca falhar ou o produto não vier, fica a imagem salva.
+  var liveImages = {}; // productId -> url da imagem principal atual
+
+  function applyAddonImage(img, url) {
+    img.style.backgroundImage = 'url("' + url + (url.indexOf("?") === -1 ? "?" : "&") + 'width=200")';
+  }
+  function refreshAddonImages(root) {
+    var pending = {}; // productId -> [.brk-bd__img]
+    (root || document).querySelectorAll(".brk-bd__item[data-addon]").forEach(function (item) {
+      var img = item.querySelector(".brk-bd__img");
+      if (!img) return;
+      var id = item.getAttribute("data-addon");
+      if (liveImages[id]) applyAddonImage(img, liveImages[id]);
+      else (pending[id] = pending[id] || []).push(img);
+    });
+    var ids = Object.keys(pending);
+    if (!ids.length) return;
+    fetch("/api/2026-07/graphql.json", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: "query($ids:[ID!]!){nodes(ids:$ids){... on Product{id featuredImage{url}}}}",
+        variables: { ids: ids.map(function (id) { return "gid://shopify/Product/" + id; }) },
+      }),
+    })
+      .then(function (res) { return res.json(); })
+      .then(function (res) {
+        ((res && res.data && res.data.nodes) || []).forEach(function (node) {
+          if (!node || !node.featuredImage) return;
+          var id = node.id.split("/").pop();
+          liveImages[id] = node.featuredImage.url;
+          (pending[id] || []).forEach(function (img) { applyAddonImage(img, node.featuredImage.url); });
+        });
+      })
+      .catch(function () {});
+  }
+
   // ── Limite de escolha ("Máx. de add-ons") ────────────────────────────────────
   // Cada bundle respeita o próprio limite. Além disso, os bundles COM limite (> 0)
   // do mesmo produto formam um grupo: o total marcado entre eles respeita o MENOR
@@ -333,6 +388,7 @@
 
           var li = document.createElement("li");
           li.className = "brk-bd__item";
+          li.setAttribute("data-addon", addon.productId);
           var row = document.createElement("label");
           row.className = "brk-bd__row";
 
@@ -387,12 +443,15 @@
                 pill.classList.add("is-active");
                 state.variantId = v.variantId;
                 if (price) price.innerHTML = priceHTML(v.priceCents, addon.mode, addon.value);
+                link.href = variantUrl(v.variantId);
                 if (check.checked) chosen[key] = state;
               });
               pillWrap.appendChild(pill);
             });
             info.appendChild(pillWrap);
           }
+          var link = addonLink(sel.variantId);
+          info.appendChild(link);
           row.appendChild(info);
 
           var lbl = interpolateLabel(addon);
@@ -426,6 +485,7 @@
 
       overlay.appendChild(card);
       document.body.appendChild(overlay);
+      refreshAddonImages(card);
 
       function close(result) { overlay.remove(); resolve(result); }
       decline.addEventListener("click", function () { close({ action: "decline", items: [] }); });
@@ -463,6 +523,7 @@
         var pills = item.querySelectorAll(".brk-bd__pill");
         if (!pills.length) return;
         var priceEl = item.querySelector(".brk-bd__price");
+        var linkEl = item.querySelector(".brk-bd__link");
         pills.forEach(function (pill) {
           if (pill.__brkBound) return;
           pill.__brkBound = true;
@@ -473,6 +534,7 @@
             pill.classList.add("is-active");
             if (check) check.setAttribute("data-variant-id", pill.getAttribute("data-variant-id"));
             if (priceEl) priceEl.innerHTML = priceHTML(Number(pill.getAttribute("data-price")), mode, value);
+            if (linkEl) linkEl.href = variantUrl(pill.getAttribute("data-variant-id"));
           });
         });
       });
@@ -612,6 +674,7 @@
     register(root);
     bindForms(root);
     bindInline(root);
+    refreshAddonImages(root);
   }
 
   if (document.readyState === "loading") {
