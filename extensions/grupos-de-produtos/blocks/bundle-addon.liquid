@@ -252,6 +252,11 @@
                         {%- endfor -%}
                       </span>
                     {%- endif -%}
+                    {%- comment -%} /variants/{id} redireciona para a página do produto do add-on {%- endcomment -%}
+                    <a class="brk-bd__link" href="{{ routes.root_url | remove_last: '/' }}/variants/{{ sel.variantId }}">
+                      {{- 'ver produto' -}}
+                      <svg class="brk-bd__link-icon" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>
+                    </a>
                   </span>
                   {%- if lbl != blank -%}<span class="brk-bd__label">{{ lbl }}</span>{%- endif -%}
                 </label>
