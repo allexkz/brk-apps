@@ -12,7 +12,10 @@ description = "Aplica o desconto do add-on (brinde 100% / porcentagem / valor fi
   [[extensions.targeting]]
   target = "cart.lines.discounts.generate.run"
   input_query = "src/cart_lines_discounts_generate_run.graphql"
-  export = "cart-lines-discounts-generate-run"
+  # JavaScript:
+  # export = "cart-lines-discounts-generate-run"
+  # Rust:
+  export = "cart_lines_discounts_generate_run"
 
   # Variables do input query ($collectionIds, $tags) vêm do mesmo metafield da
   # discount (chaves de topo), gravado pela rota admin app.bundles.jsx.
@@ -20,6 +23,14 @@ description = "Aplica o desconto do add-on (brinde 100% / porcentagem / valor fi
   namespace = "brk-bundles"
   key = "config"
 
+  # Rust (ver src/cart_lines_discounts_generate_run.rs). O JS continua em src/*.js
+  # como fallback: para voltar, comente as linhas Rust (inclusive `watch`) e
+  # descomente as JavaScript, aqui e no `export` acima.
   [extensions.build]
-  command = ""
-  path = "dist/function.wasm"
+  # JavaScript:
+  # command = ""
+  # path = "dist/function.wasm"
+  # Rust:
+  command = "cargo build --target=wasm32-unknown-unknown --release"
+  path = "target/wasm32-unknown-unknown/release/brk-bundles-discount.wasm"
+  watch = ["src/**/*.rs"]
