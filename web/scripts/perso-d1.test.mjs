@@ -177,24 +177,28 @@ await test("migração KV → D1 com o backup real: contadores batem e o KV fica
   assert.equal(PERSO_DB.stats.statements - before, 1); // só lê a flag
 });
 
-await test("webhook: pedido novo sem Nº → pendente na fila, com próxima tentativa em 15 min", async () => {
+await test("webhook: pedido novo → pendente e já vencido na fila, sem chamar o Sankhya", async () => {
   const { env, kv, db, store } = await freshEnv();
+  const calls = sk.calls;
   await ingestPersoOrder(env, kv, SHOP, persoOf(111));
   const r = rowOf(db, 111);
   assert.equal(r.status, "pending");
   assert.equal(r.retry, 1);
-  assert.equal(r.attempts, 1);
-  const waitMin = (Date.parse(r.next_try_at) - Date.now()) / 60000;
-  assert.ok(waitMin > 14 && waitMin <= 15.1, `espera ${waitMin}`);
+  assert.equal(r.attempts, 0);
+  assert.ok(Date.parse(r.next_try_at) <= Date.now(), `próxima tentativa ${r.next_try_at}`);
+  assert.equal(sk.calls, calls); // nada de Sankhya no webhook
   assert.equal((await counters(store)).pending, 1);
   assert.equal(kv.ops.put.length, 0); // nada no KV
 });
 
-await test("webhook: com Nº disponível grava na hora (sent) e guarda o Nº", async () => {
+await test("webhook: com Nº disponível, quem grava é o próximo ciclo do dreno", async () => {
   const { env, kv, db, store } = await freshEnv();
   sk.nunotaRows = [[5001, "222"]];
   sk.itemRows = [[1, 900, "C0492G", "CAMISA"]];
   await ingestPersoOrder(env, kv, SHOP, persoOf(222));
+  assert.equal(rowOf(db, 222).status, "pending");
+  const d = await drainSankhyaQueue(env, kv, SHOP);
+  assert.equal(d.sent, 1);
   const r = rowOf(db, 222);
   assert.equal(r.status, "sent");
   assert.equal(r.retry, 0);
@@ -207,6 +211,8 @@ await test("webhook: reentrega de pedido já gravado não mexe em nada", async (
   sk.nunotaRows = [[5001, "222"]];
   sk.itemRows = [[1, 900, "C0492G", "CAMISA"]];
   await ingestPersoOrder(env, kv, SHOP, persoOf(222));
+  await drainSankhyaQueue(env, kv, SHOP);
+  assert.equal(rowOf(db, 222).status, "sent");
   const before = rowOf(db, 222).updated_at;
   const calls = sk.calls;
   await ingestPersoOrder(env, kv, SHOP, persoOf(222));
@@ -231,7 +237,8 @@ await test("webhook: vendedor sem PE1198 não é registrado; vendedor com PE1198
 
 await test("dreno ocioso: fila vencida vazia = 1 consulta, sem chamar o Sankhya", async () => {
   const { env, kv, db } = await freshEnv();
-  await ingestPersoOrder(env, kv, SHOP, persoOf(111)); // próxima tentativa só daqui 15 min
+  await ingestPersoOrder(env, kv, SHOP, persoOf(111));
+  await drainSankhyaQueue(env, kv, SHOP); // 1ª tentativa sem Nº → próxima só daqui 15 min
   const calls = sk.calls;
   const st = db.stats.statements;
   const r = await drainSankhyaQueue(env, kv, SHOP);
@@ -254,14 +261,14 @@ await test("dreno: pendente vencido ganha Nº → grava; contadores pending→se
 
 await test("espera crescente: 15 → 30 → 60 min entre tentativas", async () => {
   const { env, kv, db } = await freshEnv();
-  await ingestPersoOrder(env, kv, SHOP, persoOf(111)); // tentativa 1 → +15
+  await ingestPersoOrder(env, kv, SHOP, persoOf(111)); // entra vencido, attempts 0
   const waits = [];
-  for (let i = 0; i < 2; i++) {
+  for (let i = 0; i < 3; i++) {
     db.raw.prepare("UPDATE perso_jobs SET next_try_at=? WHERE legacy_id='111'").run("2000-01-01T00:00:00Z");
     await drainSankhyaQueue(env, kv, SHOP);
     waits.push(Math.round((Date.parse(rowOf(db, 111).next_try_at) - Date.now()) / 60000));
   }
-  assert.deepEqual(waits, [30, 60]);
+  assert.deepEqual(waits, [15, 30, 60]);
   assert.equal(rowOf(db, 111).attempts, 3);
 });
 
@@ -352,6 +359,7 @@ await test("rollback: exportar D1 → KV e reimportar reproduz o mesmo estado", 
   sk.itemRows = [[1, 900, "C0492G", "CAMISA"]];
   await ingestPersoOrder(env, kv, SHOP, persoOf(111));
   await ingestPersoOrder(env, kv, SHOP, persoOf(222));
+  await drainSankhyaQueue(env, kv, SHOP); // 222 grava; 111 segue pendente
   await completeOrders(kv, SHOP, ["333"], env);
   const r = await exportToKv(env, kv, SHOP);
   assert.equal(r.jobs, 3);
@@ -384,7 +392,7 @@ await test("CUSTO CONSTANTE: mesmas consultas e linhas lidas com 10 ou 5.000 ped
       out[label] = { statements: db.stats.statements - s0, rows: db.stats.rows - r0 };
     };
     await run("webhook", () => ingestPersoOrder(env, kv, SHOP, persoOf(9999999999999)));
-    await run("dreno ocioso", () => drainSankhyaQueue(env, kv, SHOP));
+    await run("dreno (1 pedido novo)", () => drainSankhyaQueue(env, kv, SHOP));
     const ids = ["5000000000001", "5000000000002", "5000000000003"];
     await run("página (status+Nº+contadores)", async () => {
       await store.getJobs(ids);
