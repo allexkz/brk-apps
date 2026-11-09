@@ -17,6 +17,17 @@ function shopifyCli(args, appRootDir) {
   });
 }
 
+// Decimal é o mesmo valor em formatos diferentes: o JS escreve 100 / "49.90" e o Rust
+// (scalar Decimal do crate) "100.0" / "49.9". Compara os campos Decimal como número.
+function normalizeDecimals(v, key) {
+  if (Array.isArray(v)) return v.map((x) => normalizeDecimals(x));
+  if (v && typeof v === "object") {
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, normalizeDecimals(x, k)]));
+  }
+  if ((key === "value" || key === "amount") && (typeof v === "string" || typeof v === "number")) return Number(v);
+  return v;
+}
+
 describe("BRK Bundles Discount — Integration Test", () => {
   let schema;
   let functionDir;
@@ -55,9 +66,16 @@ describe("BRK Bundles Discount — Integration Test", () => {
       expect(validationResult.inputFixture.errors).toEqual([]);
       expect(validationResult.outputFixture.errors).toEqual([]);
 
-      const runResult = await runFunction(fixture, functionRunnerPath, wasmPath, targetInputQueryPath, schemaPath);
+      // O `export` gravado no fixture é o nome JS; usa o do shopify.extension.toml (JS ou Rust).
+      const runResult = await runFunction(
+        { ...fixture, export: targeting[fixture.target].export ?? fixture.export },
+        functionRunnerPath,
+        wasmPath,
+        targetInputQueryPath,
+        schemaPath,
+      );
       expect(runResult.error).toBeNull();
-      expect(runResult.result.output).toEqual(fixture.expectedOutput);
+      expect(normalizeDecimals(runResult.result.output)).toEqual(normalizeDecimals(fixture.expectedOutput));
     }, 10000);
   });
 });
