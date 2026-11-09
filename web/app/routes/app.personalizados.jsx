@@ -187,7 +187,7 @@ export const loader = async ({ request, context }) => {
           for (const r of page.rows) if (found[r.legacyId] != null) r.nunota = found[r.legacyId];
         }
       } catch (e) {
-        console.error("[personalizados sankhya]", e);
+        console.error("[personalizados sankhya]", e?.message || e);
         sankhyaError = e?.message || String(e);
       }
     }

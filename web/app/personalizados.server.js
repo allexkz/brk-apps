@@ -598,8 +598,11 @@ async function processPersoJobsKV(env, kv, shop, legacyIds = null) {
   return { processed: targetIds.length, sent, pending, errors };
 }
 
-// Ingestão de UM pedido novo (webhook orders/create): grava o job e tenta gravar na
-// hora (best-effort; normalmente cai em "pending" por falta de NUNOTA → cron reprocessa).
+// Ingestão de UM pedido novo (webhook orders/create): só grava o job na fila. NÃO chama
+// o Sankhya daqui: o webhook roda no PoP da Cloudflare mais perto da Shopify (ex.: Chicago),
+// e o Sankhya bloqueia IP fora do Brasil; no orders/create o pedido ainda nem chegou ao
+// Sankhya pelo integrador; e a Shopify exige resposta em 5 s (a tentativa levava 7–8 s →
+// reentrega e risco de remover a inscrição). Quem grava é o dreno (DO em São Paulo).
 export async function ingestPersoOrder(env, kv, shop, perso) {
   if (!perso || !perso.legacyId) return;
   // Sem PE1198 e sem vendedor: nada a gravar (os ramos abaixo só agem com um dos dois).
@@ -628,15 +631,10 @@ export async function ingestPersoOrder(env, kv, shop, perso) {
   }
 
   await updateSankhyaStatus(kv, shop, { [id]: { name: perso.name, status: "pending", retry: true, reason: PENDING_NUNOTA_REASON, seller: perso.seller || null, personalizations: perso.personalizations.map(slimPerso), at: nowISO() } });
-
-  try {
-    await processPersoJobs(env, kv, shop, [id]);
-  } catch (e) {
-    console.error("[perso ingest process]", e?.message || e);
-  }
 }
 
-// Versão D1 da ingestão: lê/grava só a linha deste pedido.
+// Versão D1 da ingestão: lê/grava só a linha deste pedido. Entra vencida (nextTryAt =
+// agora, attempts 0): o próximo ciclo do dreno faz a 1ª tentativa.
 async function ingestPersoOrderD1(env, kv, store, perso) {
   const id = String(perso.legacyId);
   const cur = (await store.getJobs([id]))[id];
@@ -667,11 +665,6 @@ async function ingestPersoOrderD1(env, kv, store, perso) {
       hasAttrs: true,
     },
   });
-  try {
-    await processPersoJobsD1(env, kv, store, [id]);
-  } catch (e) {
-    console.error("[perso ingest process]", e?.message || e);
-  }
 }
 
 // Dreno do cron: reprocessa os jobs pendentes/transitórios (retry===true). Quando NÃO
