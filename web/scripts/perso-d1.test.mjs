@@ -272,6 +272,33 @@ await test("espera crescente: 15 → 30 → 60 min entre tentativas", async () =
   assert.equal(rowOf(db, 111).attempts, 3);
 });
 
+await test("Nº encontrado fora do dreno: pendente em espera longa volta a vencer agora", async () => {
+  const { env, kv, db, store } = await freshEnv();
+  await ingestPersoOrder(env, kv, SHOP, persoOf(111));
+  await ingestPersoOrder(env, kv, SHOP, persoOf(222));
+  const later = new Date(Date.now() + 8 * 3600000).toISOString(); // espera de 8 h (6ª tentativa)
+  db.raw.prepare("UPDATE perso_jobs SET next_try_at=?, attempts=6").run(later);
+  await completeOrders(kv, SHOP, ["222"], env); // concluído: não volta para a fila
+  await store.saveNunotas({ 111: 7001, 222: 7002 }); // ex.: a dashboard achou os Nº
+  assert.ok(Date.parse(rowOf(db, 111).next_try_at) <= Date.now());
+  assert.equal(rowOf(db, 222).next_try_at, null);
+  sk.nunotaRows = [[7001, "111"]];
+  sk.itemRows = [[1, 900, "C0492G", "CAMISA"]];
+  const r = await drainSankhyaQueue(env, kv, SHOP); // o próximo ciclo já grava
+  assert.equal(r.sent, 1);
+  assert.equal(rowOf(db, 111).status, "sent");
+});
+
+await test("Nº salvo de novo em pedido que já tinha Nº não mexe na espera", async () => {
+  const { env, kv, db, store } = await freshEnv();
+  await ingestPersoOrder(env, kv, SHOP, persoOf(111));
+  await store.saveNunotas({ 111: 7001 });
+  const later = new Date(Date.now() + 8 * 3600000).toISOString(); // ex.: erro transitório ao gravar
+  db.raw.prepare("UPDATE perso_jobs SET next_try_at=? WHERE legacy_id='111'").run(later);
+  await store.saveNunotas({ 111: 7001 });
+  assert.equal(rowOf(db, 111).next_try_at, later);
+});
+
 await test(`após ${GIVE_UP_DAYS} dias sem Nº: sai da fila e aparece em "Presos"`, async () => {
   const { env, kv, db, store } = await freshEnv();
   await ingestPersoOrder(env, kv, SHOP, persoOf(111));
