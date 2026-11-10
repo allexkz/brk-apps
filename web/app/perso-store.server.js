@@ -157,13 +157,18 @@ export function d1Store(db, shop) {
     },
 
     // Grava Nº Sankhya ({ legacyId: nunota }); cria a linha (sem status) se não existir.
+    // Pendente na fila que estava sem Nº volta a vencer agora: o que ele esperava chegou, e a
+    // espera crescente (até 24 h) só valia enquanto faltava o Nº (pedido que levou horas para
+    // chegar ao Sankhya ficava parado até a próxima tentativa). No SET, `nunota` é o valor antigo.
     async saveNunotas(map) {
       const entries = Object.entries(map || {}).filter(([, n]) => n != null);
       if (!entries.length) return;
       const now = nowISO();
       const stmt = db.prepare(
         `INSERT INTO perso_jobs (shop, legacy_id, nunota, updated_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT (shop, legacy_id) DO UPDATE SET nunota = excluded.nunota, updated_at = excluded.updated_at`
+         ON CONFLICT (shop, legacy_id) DO UPDATE SET nunota = excluded.nunota, updated_at = excluded.updated_at,
+           next_try_at = CASE WHEN nunota IS NULL AND retry = 1 AND status = 'pending'
+                              THEN excluded.updated_at ELSE next_try_at END`
       );
       await db.batch(entries.map(([id, n]) => stmt.bind(shop, String(id), Number(n), now)));
     },
